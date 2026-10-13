@@ -1,6 +1,7 @@
 """Watch a trained agent play PokeSurvivor in a visible browser window.
 
-    python play.py                                   # latest checkpoint
+    python play.py                                   # latest checkpoint (or models/best.zip)
+    python play.py --model models/best.zip           # the best evaluated model
     python play.py --model checkpoints/ppo_pokesurvivor/final.zip
     python play.py --record videos                   # also save a .webm video
     python play.py --random                          # baseline: random moves
@@ -16,7 +17,10 @@ from pokesurvivor_rl.env import PokeSurvivorEnv
 
 def latest_checkpoint():
     files = sorted(Path("checkpoints").glob("**/*.zip"), key=lambda f: f.stat().st_mtime)
-    return files[-1] if files else None
+    if files:
+        return files[-1]
+    best = Path("models/best.zip")  # shipped with the repo
+    return best if best.exists() else None
 
 
 def main():
@@ -30,6 +34,8 @@ def main():
     p.add_argument("--headless", action="store_true")
     p.add_argument("--save", type=str, default="progress/play.json",
                    help="file that keeps coins + permanent upgrades between sessions")
+    p.add_argument("--account", action="store_true",
+                   help="play with the account logged in via login.py (progress saved to the account)")
     p.add_argument("--no-upgrade", action="store_true", help="do not spend coins on upgrades")
     args = p.parse_args()
 
@@ -44,13 +50,16 @@ def main():
 
     env = PokeSurvivorEnv(headless=args.headless, partner=args.partner, record_dir=args.record,
                           realtime=args.speed > 0, save_path=args.save,
-                          auto_upgrade=not args.no_upgrade)
+                          auto_upgrade=not args.no_upgrade,
+                          profile_dir="browser_profile" if args.account else None)
     if args.speed > 0:
         env.frame_skip = 3
     n_stack = 4
     try:
         for ep in range(args.episodes):
             obs, _ = env.reset()
+            if ep == 0 and env.account_user:
+                print("account:", env.account_user, "| partner dex:", env.partner)
             if env.last_bought:
                 print("   bought upgrades:", ", ".join(env.last_bought))
             print(f"   coins: {env.progress.get('coins', 0)}  upgrades: {env.upgrade_levels() or '-'}")

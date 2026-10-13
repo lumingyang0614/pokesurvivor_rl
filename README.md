@@ -52,5 +52,14 @@ python play.py --speed 0           # 不限速快速跑
 - `progress/play.json`：觀看模式用（`--save` 可換檔、`--no-upgrade` 關閉自動強化）
 - `progress/train_env*.json`：每個訓練環境各自累積
 
+### 用自己的帳號記錄（選用）
+```bash
+python login.py            # 開視窗，自己登入（Google 或遊戲帳號），登入後自動關閉
+python play.py --account   # 用該帳號玩，金幣／強化／統計存到雲端帳號
+```
+- 登入資訊只存在本機 `browser_profile/`（已列入 .gitignore），密碼只在瀏覽器視窗輸入。
+- 只有觀看模式會用帳號；訓練一律用訪客，避免多個瀏覽器同時寫同一份雲端存檔。
+- AI 的成績**不會**上傳公開排行榜。
+
 `--partner` 可換夥伴（圖鑑編號，例如 1 妙蛙種子、4 小火龍、7 傑尼龜）。
 Checkpoints 存在 `checkpoints/<name>/`，`--resume` 可接續訓練。

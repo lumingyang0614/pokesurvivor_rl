@@ -15,6 +15,16 @@
   };
   window.cancelAnimationFrame = () => {};
 
+  // The game reloads itself between runs when a new version is deployed
+  // (G.Updater polls version.json). Hide new versions so a run never vanishes;
+  // a fresh browser launch still loads the latest game.
+  const realFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const url = typeof input === "string" ? input : (input && input.url) || "";
+    if (url.includes("version.json")) return Promise.resolve(new Response("{}", { status: 404 }));
+    return realFetch(input, init);
+  };
+
   // Training mode: give the main game canvas a do-nothing 2D context so no CPU is
   // spent drawing frames nobody looks at. Game logic is unaffected.
   if (window.__RL_NORENDER) {
@@ -133,6 +143,7 @@
       ups[best] = (ups[best] || 0) + 1;
       bought.push(best + ">" + ups[best]);
     }
+    if (bought.length && G.DB.commit) G.DB.commit(true);
     return bought;
   }
 
@@ -263,18 +274,24 @@
       if (!m) { const q = queue; queue = []; for (const cb of q) realRAF(cb); }
     },
     pump,
-    boot(partner) {
+    boot(partner, account) {
       if (!G.DB.save) G.DB.playAsGuest();
       const s = G.DB.save;
-      if (G.DB.grant && !G.DB.owns(partner)) G.DB.grant(partner, "starter");
-      s.partner = partner;
-      s.starter = s.starter || partner;
+      if (account) {
+        // real account: never hand out Pokemon; fall back to the account's partner
+        if (G.DB.owns(partner)) s.partner = partner;
+        else if (!s.partner) { G.DB.grant(partner, "starter"); s.partner = partner; }
+      } else {
+        if (G.DB.grant && !G.DB.owns(partner)) G.DB.grant(partner, "starter");
+        s.partner = partner;
+      }
+      s.starter = s.starter || s.partner;
       for (const id of ["tap-start", "boot"]) {
         const el = document.getElementById(id);
         if (el) el.classList.add("hidden");
       }
       hookUI();
-      return true;
+      return s.partner;
     },
     reset(partner, upgrade) {
       hookUI();

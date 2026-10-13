@@ -24,6 +24,11 @@ BRIDGE_JS = (Path(__file__).parent / "bridge.js").read_text(encoding="utf-8")
 N_SECT, N_CH, N_FEATS, N_NEAR = 16, 8, 14, 8 * 4
 OBS_DIM = N_SECT * N_CH + N_FEATS + N_NEAR
 
+# Flags for the persistent (logged-in) profile: Google refuses sign-in from browsers
+# that announce they are automated.
+PROFILE_ARGS = ["--disable-blink-features=AutomationControlled"]
+PROFILE_IGNORE = ["--enable-automation"]
+
 STARTERS = {"bulbasaur": 1, "charmander": 4, "squirtle": 7, "pikachu": 25}
 
 
@@ -40,6 +45,7 @@ class PokeSurvivorEnv(gym.Env):
         render: bool | None = None,
         auto_upgrade: bool = True,
         save_path: str | None = None,
+        profile_dir: str | None = None,
         record_dir: str | None = None,
         viewport=(960, 540),
     ):
@@ -54,6 +60,12 @@ class PokeSurvivorEnv(gym.Env):
         self.auto_upgrade = auto_upgrade
         # JSON file that keeps coins + permanent upgrades across browser restarts
         self.save_path = Path(save_path) if save_path else None
+        # persistent browser profile with a logged-in game account (see login.py);
+        # progress then lives in the account's cloud save instead of save_path
+        self.profile_dir = profile_dir
+        if profile_dir:
+            self.save_path = None
+        self.account_user = None
         self.last_bought: list = []
         self.progress: dict = {}
         # skip canvas drawing when nobody watches (headless training without video)
@@ -73,12 +85,17 @@ class PokeSurvivorEnv(gym.Env):
             self._port = sk.getsockname()[1]
         args = ["--mute-audio", "--autoplay-policy=no-user-gesture-required",
                 f"--remote-debugging-port={self._port}"]
-        self._browser = self._pw.chromium.launch(headless=self.headless, args=args)
         kw = dict(viewport={"width": self.viewport[0], "height": self.viewport[1]})
         if self.record_dir:
             kw["record_video_dir"] = self.record_dir
             kw["record_video_size"] = kw["viewport"]
-        self._ctx = self._browser.new_context(**kw)
+        if self.profile_dir:
+            self._ctx = self._pw.chromium.launch_persistent_context(
+                self.profile_dir, headless=self.headless, args=args + PROFILE_ARGS,
+                ignore_default_args=PROFILE_IGNORE, **kw)
+        else:
+            self._browser = self._pw.chromium.launch(headless=self.headless, args=args)
+            self._ctx = self._browser.new_context(**kw)
         if not self.render_frames:
             self._ctx.add_init_script("window.__RL_NORENDER = true;")
         self._ctx.add_init_script(BRIDGE_JS)
@@ -97,7 +114,17 @@ class PokeSurvivorEnv(gym.Env):
             if ok:
                 break
             time.sleep(0.05)
-        self.page.evaluate(f"() => RL.boot({int(self.partner)})")
+        if self.profile_dir:
+            for _ in range(200):  # cloud save loads asynchronously
+                self.account_user = self.page.evaluate(
+                    "() => G.DB.loggedIn && !G.DB.guest && G.DB.save ? (G.DB.user || 'account') : null")
+                if self.account_user:
+                    break
+                time.sleep(0.1)
+            if not self.account_user:
+                self.close()
+                raise RuntimeError("Not logged in - run `python login.py` first")
+        self.partner = self.page.evaluate(f"() => RL.boot({int(self.partner)}, {'true' if self.profile_dir else 'false'})")
         if self.save_path and self.save_path.exists():
             self.page.evaluate("p => RL.setProgress(p)", json.loads(self.save_path.read_text()))
         # Hot loop goes over a raw CDP websocket: ~0.2 ms per call instead of ~1.7 ms
@@ -132,6 +159,11 @@ class PokeSurvivorEnv(gym.Env):
         super().reset(seed=seed)
         if self.page is None:
             self._launch()
+        try:
+            self._eval("RL.ready()")
+        except Exception:
+            self.close()
+            self._launch()
         r = self._eval(f"RL.reset({int(self.partner)}, {'true' if self.auto_upgrade else 'false'})")
         self.last_stats = r["stats"]
         self.last_bought = r["bought"]
@@ -143,7 +175,14 @@ class PokeSurvivorEnv(gym.Env):
         return self._obs(r["obs"]), {}
 
     def step(self, action):
-        r = self._eval(f"RL.step({int(action)}, {self.frame_skip})")
+        try:
+            r = self._eval(f"RL.step({int(action)}, {self.frame_skip})")
+        except Exception as e:  # page reloaded / browser died: end episode, relaunch on reset
+            print(f"[env] browser lost ({str(e).splitlines()[0][:120]}); relaunching on reset")
+            st = dict(self.last_stats or {})
+            self.close()
+            return (np.zeros(self.observation_space.shape, np.float32), 0.0, True, False,
+                    {"stats": st, "crashed": True})
         st = r["stats"]
         self.last_stats = st
         reward = (
