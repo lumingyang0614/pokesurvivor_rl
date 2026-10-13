@@ -325,14 +325,16 @@ class PokeSurvivorEnv(gym.Env):
                 self._save_progress()
             except Exception:
                 pass
+        # best effort: after a browser crash some of these are already gone
+        for part in (self._ws, self._ctx, self._browser):
+            try:
+                if part:
+                    part.close()
+            except Exception:
+                pass
         try:
-            if self._ws:
-                self._ws.close()
-            if self._ctx:
-                self._ctx.close()
-            if self._browser:
-                self._browser.close()
             if self._pw:
                 self._pw.stop()
-        finally:
-            self._pw = self._browser = self._ctx = self.page = self._ws = None
+        except Exception:
+            pass
+        self._pw = self._browser = self._ctx = self.page = self._ws = None
