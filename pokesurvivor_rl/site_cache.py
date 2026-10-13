@@ -25,6 +25,10 @@ BLOCK = ("/sw.js",)                       # no service worker in the mirror
 _fetch_lock = threading.Lock()            # one upstream request at a time per process
 _last_fetch = [0.0]
 MIN_GAP = 0.25                            # seconds between upstream requests
+COOLDOWN = 600                            # after a 429, leave the site alone this long
+_blocked_until = [0.0]
+# PS_MIRROR_OFFLINE=1: never contact the site, missing files are simply 404
+OFFLINE = os.environ.get("PS_MIRROR_OFFLINE") == "1"
 
 
 def _paths(key: str):
@@ -34,9 +38,13 @@ def _paths(key: str):
 
 def _fetch_upstream(path_q: str):
     """Download ORIGIN+path_q politely. Returns (status, headers, body)."""
+    if OFFLINE or time.time() < _blocked_until[0]:
+        return 404, {"Content-Type": "text/plain"}, b""
     with _fetch_lock:
         delay = 2.0
-        for _ in range(8):
+        for _ in range(3):
+            if time.time() < _blocked_until[0]:
+                break
             wait = MIN_GAP - (time.time() - _last_fetch[0])
             if wait > 0:
                 time.sleep(wait)
@@ -46,15 +54,17 @@ def _fetch_upstream(path_q: str):
                 with urllib.request.urlopen(req, timeout=30) as r:
                     return r.status, {"Content-Type": r.headers.get("Content-Type", "application/octet-stream")}, r.read()
             except urllib.error.HTTPError as e:
-                if e.code == 429 or e.code >= 500:
-                    ra = e.headers.get("Retry-After")
-                    time.sleep(max(delay, float(ra) if ra and ra.isdigit() else 0))
-                    delay = min(delay * 2, 120)
+                if e.code == 429:
+                    _blocked_until[0] = time.time() + COOLDOWN
+                    break
+                if e.code >= 500:
+                    time.sleep(delay)
+                    delay *= 2
                     continue
                 return e.code, {"Content-Type": "text/plain"}, b""
             except Exception:
                 time.sleep(delay)
-                delay = min(delay * 2, 120)
+                delay *= 2
         return 503, {"Content-Type": "text/plain"}, b"upstream unavailable"
 
 
@@ -68,12 +78,17 @@ def get(path_q: str):
         return 200, json.loads(meta_p.read_text()), body_p.read_bytes()
     status, headers, body = _fetch_upstream(path_q)
     if status == 200:
-        body_p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = body_p.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_bytes(body)
-        os.replace(tmp, body_p)  # atomic: other processes never see half a file
-        meta_p.write_text(json.dumps(headers))
+        store(path_q, headers, body)
     return status, headers, body
+
+
+def store(path_q: str, headers: dict, body: bytes):
+    body_p, meta_p = _paths(path_q)
+    body_p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = body_p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_bytes(body)
+    os.replace(tmp, body_p)  # atomic: other processes never see half a file
+    meta_p.write_text(json.dumps(headers))
 
 
 class _Handler(BaseHTTPRequestHandler):

@@ -61,9 +61,10 @@ Playwright + CDP ── Chromium ── pokesurvivor.com（原版遊戲）
 pip install -r requirements.txt
 python -m playwright install chromium
 
-# 訓練（12 個平行瀏覽器，背景無頭模式）
+# 訓練（12 個平行瀏覽器，背景無頭模式；遊戲從本機快取鏡像載入，不會連到官方網站）
 python train.py --envs 12 --steps 20000000
 tensorboard --logdir runs          # game/survive_sec、game/rifts_won、late/* 曲線
+python monitor.py                  # 終端機即時監控：最佳紀錄、近期平均、進步曲線、前 5 名
 
 # 挑出最佳模型 → models/best.zip
 python evaluate.py --last 8 --episodes 10

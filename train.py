@@ -4,6 +4,9 @@
     tensorboard --logdir runs
 """
 import argparse
+import json
+import os
+import time
 from pathlib import Path
 
 from sb3_contrib import MaskablePPO
@@ -24,13 +27,24 @@ def make_env(rank, partner, frame_skip, curriculum, switch_partner):
 
 
 class GameStatsCallback(BaseCallback):
-    """Logs in-game results of finished episodes (normal and late-game starts separately)."""
+    """Logs in-game results of finished episodes (normal and late-game starts separately)
+    to TensorBoard and appends every episode to logs/episodes.jsonl (read by monitor.py)."""
+
+    def __init__(self, log_path="logs/episodes.jsonl"):
+        super().__init__()
+        self.log_path = Path(log_path)
+        self.log_path.parent.mkdir(exist_ok=True)
 
     def _on_step(self) -> bool:
-        for info in self.locals["infos"]:
+        for i, info in enumerate(self.locals["infos"]):
             st = info.get("episode_stats")
             if not st:
                 continue
+            rec = {k: st.get(k) for k in ("time", "start_time", "level", "kills", "bosses", "riftsEntered",
+                                          "riftsWon", "partner", "max_start", "level_rate")}
+            rec.update(env=i, step=int(self.num_timesteps), wall=time.time(), moves=st.get("moves"))
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if st.get("start_time", 0) > 0:
                 self.logger.record_mean("late/survive_sec", st["time"] - st["start_time"])
                 self.logger.record_mean("late/start_time", st["start_time"])
@@ -55,9 +69,14 @@ def main():
     p.add_argument("--curriculum", type=float, default=0.4, help="share of runs that start in the late game")
     p.add_argument("--switch-partner", action="store_true",
                    help="let the meta step switch to stronger gacha partners (default: train one partner)")
+    p.add_argument("--online", action="store_true",
+                   help="let the local mirror download missing files from the site (default: offline, "
+                        "only cached files - training needs no images)")
     p.add_argument("--resume", type=str, default=None, help="path to a .zip checkpoint")
     p.add_argument("--name", type=str, default="maskppo_v2")
     args = p.parse_args()
+    if not args.online:
+        os.environ["PS_MIRROR_OFFLINE"] = "1"  # inherited by the env subprocesses
 
     venv = SubprocVecEnv([make_env(i, args.partner, args.frame_skip, args.curriculum, args.switch_partner) for i in range(args.envs)])
     venv = VecMonitor(venv)
