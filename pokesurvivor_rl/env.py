@@ -22,6 +22,8 @@ from gymnasium import spaces
 import websocket
 from playwright.sync_api import sync_playwright
 
+from . import site_cache
+
 GAME_URL = "https://pokesurvivor.com/en/"
 BRIDGE_JS = (Path(__file__).parent / "bridge.js").read_text(encoding="utf-8")
 
@@ -58,6 +60,7 @@ class PokeSurvivorEnv(gym.Env):
         profile_dir: str | None = None,
         ranking: bool = False,
         invest: str | int | None = None,
+        mirror: bool | None = None,
         record_dir: str | None = None,
         viewport=(960, 540),
     ):
@@ -88,6 +91,9 @@ class PokeSurvivorEnv(gym.Env):
         self.ranking = bool(ranking and profile_dir)
         # coin plan: None (upgrade current partner), "auto" or a Pokedex number to invest in
         self.invest = invest
+        # load the game from the local cached mirror (default for guests); a logged-in
+        # account needs the real domain for its sign-in
+        self.mirror = (not profile_dir) if mirror is None else mirror
         self.last_meta: dict = {}
         self.last_mask = np.ones(N_ACTIONS, bool)
         self._hist = []
@@ -110,7 +116,7 @@ class PokeSurvivorEnv(gym.Env):
                 self.close()
                 if i == attempts - 1 or "Not logged in" in str(e):
                     raise
-                time.sleep(5 * (i + 1))
+                time.sleep(30 * (i + 1))  # back off: never hammer the site
 
     def _launch_once(self):
         self._pw = sync_playwright().start()
@@ -134,9 +140,10 @@ class PokeSurvivorEnv(gym.Env):
             self._ctx.add_init_script("window.__RL_NORENDER = true;")
         self._ctx.add_init_script(BRIDGE_JS)
         self.page = self._ctx.new_page()
-        self.page.goto(GAME_URL, wait_until="load", timeout=120_000)
+        url = site_cache.start() if self.mirror else GAME_URL
+        self.page.goto(url, wait_until="load", timeout=180_000)
         # boot needs animation frames for fonts/UI; pump until the game objects exist
-        for _ in range(600):
+        for _ in range(1800):  # first mirror load may download assets slowly
             if self.page.evaluate("() => !!(window.RL && RL.ready() && G.DB && G.DB.ready)"):
                 break
             time.sleep(0.1)
@@ -171,7 +178,7 @@ class PokeSurvivorEnv(gym.Env):
         # through Playwright's driver.
         targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self._port}/json/list"))
         url = next(t["webSocketDebuggerUrl"] for t in targets
-                   if t["type"] == "page" and "pokesurvivor" in t["url"])
+                   if t["type"] == "page" and t["url"].startswith(url.rsplit("/en/", 1)[0]))
         self._ws = websocket.create_connection(url, suppress_origin=True, timeout=60)
 
     def _eval(self, expr: str):
