@@ -1,0 +1,7 @@
+playwright>=1.52
+gymnasium>=1.0
+stable-baselines3[extra]>=2.3
+torch>=2.2
+numpy
+tensorboard
+websocket-client

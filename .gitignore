@@ -1,0 +1,7 @@
+checkpoints/
+runs/
+videos/
+logs/
+__pycache__/
+*.pyc
+progress/
