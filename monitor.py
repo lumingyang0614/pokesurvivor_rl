@@ -13,6 +13,7 @@ from pathlib import Path
 
 EPISODES = Path("logs/episodes.jsonl")
 TRAIN_LOG = Path("logs/train_v2.log")
+ACCOUNT = Path("logs/account_episodes.jsonl")
 
 
 def mmss(sec):
@@ -20,10 +21,10 @@ def mmss(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
-def load():
+def load(path=EPISODES):
     eps = []
-    if EPISODES.exists():
-        for line in EPISODES.read_text(encoding="utf-8").splitlines():
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
             try:
                 eps.append(json.loads(line))
             except json.JSONDecodeError:
@@ -92,6 +93,17 @@ def render():
                    f"free levels {late[-1].get('level_rate', 0):.1f}/min, survives {mmss(stats.mean(lasted))} on average")
         out.append(f"   best: started at {mmss(bl['start_time'])}, lasted {mmss(bl['time'] - bl['start_time'])} "
                    f"(reached {mmss(bl['time'])}, level {bl['level']})")
+    acc = load(ACCOUNT)
+    if acc:
+        last = acc[-1]
+        best = max(acc, key=lambda e: e["time"])
+        ago = int(time.time() - last.get("wall", time.time()))
+        out.append("")
+        out.append(f"ACCOUNT {last.get('account')}: {len(acc)} runs, coins now {last.get('coins')}, "
+                   f"best {mmss(best['time'])} (lv {best['level']}, bosses {best['bosses']}, "
+                   f"rifts {best.get('riftsWon', 0)}/{best.get('riftsEntered', 0)}), "
+                   f"last run {mmss(last['time'])} {ago // 60} min ago")
+        out.append(f"   upgrades: {last.get('upgrades')}")
     return "\n".join(out)
 
 

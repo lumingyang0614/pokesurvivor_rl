@@ -8,6 +8,9 @@
     python play.py --random                          # baseline: random (valid) actions
 """
 import argparse
+import itertools
+import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +29,10 @@ def latest_checkpoint():
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=str, default=None)
-    p.add_argument("--episodes", type=int, default=3)
+    p.add_argument("--episodes", type=int, default=3, help="0 = keep playing forever")
+    p.add_argument("--reload", action="store_true",
+                   help="before every run, switch to the newest checkpoint (keeps up with training)")
+    p.add_argument("--log", type=str, default=None, help="append every run to this .jsonl file")
     p.add_argument("--partner", type=int, default=4)
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = real time, 0 = as fast as possible")
     p.add_argument("--record", type=str, default=None, help="directory to save videos into")
@@ -47,14 +53,26 @@ def main():
                         "this Pokemon and switch to it once its upgrades are maxed")
     args = p.parse_args()
 
-    model = None
-    if not args.random:
+    model, model_path = None, None
+
+    def load_model():
+        nonlocal model, model_path
         from sb3_contrib import MaskablePPO
-        path = args.model or latest_checkpoint()
+        path = Path(args.model) if args.model else latest_checkpoint()
         if path is None:
             raise SystemExit("No checkpoint found - train first, or pass --random")
-        print("loading", path)
-        model = MaskablePPO.load(path, device="cpu")
+        if path != model_path:
+            for _ in range(5):  # a checkpoint may still be being written
+                try:
+                    model = MaskablePPO.load(path, device="cpu")
+                    break
+                except Exception:
+                    time.sleep(3)
+            model_path = path
+            print("model:", path, flush=True)
+
+    if not args.random:
+        load_model()
 
     env = PokeSurvivorEnv(headless=args.headless, partner=args.partner, record_dir=args.record,
                           realtime=args.speed > 0, save_path=args.save, meta=not args.no_meta,
@@ -64,7 +82,9 @@ def main():
                           invest=args.invest)
     rng = np.random.default_rng()
     try:
-        for ep in range(args.episodes):
+        for ep in (itertools.count() if args.episodes == 0 else range(args.episodes)):
+            if args.reload and not args.random and not args.model:
+                load_model()
             obs, info = env.reset()
             meta = info["meta"]
             if ep == 0 and env.account_user:
@@ -93,7 +113,12 @@ def main():
             m, s = divmod(int(st["time"]), 60)
             print(f"episode {ep + 1}: survived {m}:{s:02d}, level {st['level']}, kills {st['kills']}, "
                   f"bosses {st['bosses']}, rifts won {st['riftsWon']}/{st['riftsEntered']}, return {ret:.1f}")
-            print("   moves:", ", ".join(st["moves"]))
+            print("   moves:", ", ".join(st["moves"]), flush=True)
+            if args.log:
+                rec = dict(st, wall=time.time(), model=str(model_path), coins=meta.get("coins"),
+                           account=env.account_user, upgrades=meta.get("upgrades"))
+                with open(args.log, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     finally:
         env.close()
         if args.record:

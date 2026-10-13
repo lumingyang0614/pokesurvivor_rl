@@ -80,6 +80,9 @@ python play.py --random            # 對照組：隨機
 python login.py            # 開視窗，自己登入（Google 或遊戲帳號），登入後自動關閉
 python play.py --account   # 用該帳號玩：存檔、扭蛋、強化、統計存到雲端，成績上排行榜
 python play.py --account --no-ranking   # 不上排行榜
+
+# 讓帳號一直自動玩、賺金幣（真實速度，每局自動換成最新模型，成績寫入 monitor）
+python play.py --account --episodes 0 --reload --log logs/account_episodes.jsonl
 ```
 - 登入資訊只存在本機 `browser_profile/`（已列入 .gitignore），密碼只在瀏覽器視窗輸入。
 - **只有登入帳號的觀看模式**會上傳排行榜；訓練一律用訪客且不上傳，避免灌爆官方伺服器。
