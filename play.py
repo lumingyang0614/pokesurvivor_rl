@@ -40,7 +40,8 @@ def main():
                    help="with --account: do not submit results to the public leaderboard")
     p.add_argument("--no-meta", action="store_true",
                    help="do not claim missions / pull gacha / switch partner / buy upgrades")
-    p.add_argument("--keep-partner", action="store_true", help="never switch to a stronger partner")
+    p.add_argument("--auto-partner", action="store_true",
+                   help="switch to the strongest owned partner between runs (default: keep the partner)")
     args = p.parse_args()
 
     model = None
@@ -54,7 +55,7 @@ def main():
 
     env = PokeSurvivorEnv(headless=args.headless, partner=args.partner, record_dir=args.record,
                           realtime=args.speed > 0, save_path=args.save, meta=not args.no_meta,
-                          choose_partner=not args.keep_partner,
+                          choose_partner=args.auto_partner,
                           profile_dir="browser_profile" if args.account else None,
                           ranking=args.account and not args.no_ranking)
     rng = np.random.default_rng()

@@ -13,10 +13,11 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 from pokesurvivor_rl.env import PokeSurvivorEnv
 
 
-def make_env(rank, partner, frame_skip, curriculum):
+def make_env(rank, partner, frame_skip, curriculum, switch_partner):
     def _thunk():
         return PokeSurvivorEnv(headless=True, partner=partner, frame_skip=frame_skip,
-                               curriculum=curriculum, save_path=f"progress/train_env{rank}.json")
+                               curriculum=curriculum, choose_partner=switch_partner,
+                               save_path=f"progress/train_env{rank}.json")
     return _thunk
 
 
@@ -50,11 +51,13 @@ def main():
     p.add_argument("--partner", type=int, default=4, help="starting partner (Pokedex number, 4 = Charmander)")
     p.add_argument("--frame-skip", type=int, default=3)
     p.add_argument("--curriculum", type=float, default=0.4, help="share of runs that start in the late game")
+    p.add_argument("--switch-partner", action="store_true",
+                   help="let the meta step switch to stronger gacha partners (default: train one partner)")
     p.add_argument("--resume", type=str, default=None, help="path to a .zip checkpoint")
     p.add_argument("--name", type=str, default="maskppo_v2")
     args = p.parse_args()
 
-    venv = SubprocVecEnv([make_env(i, args.partner, args.frame_skip, args.curriculum) for i in range(args.envs)])
+    venv = SubprocVecEnv([make_env(i, args.partner, args.frame_skip, args.curriculum, args.switch_partner) for i in range(args.envs)])
     venv = VecMonitor(venv)
 
     ckpt_dir = Path("checkpoints") / args.name
