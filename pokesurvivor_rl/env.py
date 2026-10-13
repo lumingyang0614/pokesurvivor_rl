@@ -1,7 +1,8 @@
 """Gymnasium environment that plays https://pokesurvivor.com through Playwright.
 
 Actions (masked, use MaskablePPO):
-  0 stand, 1-8 move in 8 directions, 9-11 pick a level-up card,
+  0 stand, 1-8 move in 8 directions, 9-11 pick an option of the open menu
+  (level-up card, which moves to bond, keep or swap a held item),
   12-15 switch the active move slot (only the active slot attacks).
 Attacks are automatic in the game. Between runs a "meta" step claims missions,
 spends gacha tickets, picks the strongest owned partner and buys permanent upgrades.
@@ -29,10 +30,12 @@ BRIDGE_JS = (Path(__file__).parent / "bridge.js").read_text(encoding="utf-8")
 
 # must match bridge.js
 N_SECT, N_CH, N_FEATS, N_NEAR, SLOT_DIM, CARD_DIM, N_ACTIONS = 16, 9, 36, 8 * 4, 21, 34, 16
+CHOICE_DIM = 3 + 11 + 3 * (19 + 11)   # open menu kind, held item, bond / item options
+MAP_DIM = N_SECT * 5 + 10             # chests, grass, springs/altars, traps
 HIST_CH = 3        # enemy / density / projectile channels kept from previous steps
 N_HIST = 2
 GRID_DIM = N_SECT * N_CH
-OBS_DIM = GRID_DIM + N_HIST * N_SECT * HIST_CH + N_FEATS + N_NEAR + 4 * SLOT_DIM + 3 * CARD_DIM
+OBS_DIM = GRID_DIM + N_HIST * N_SECT * HIST_CH + N_FEATS + N_NEAR + 4 * SLOT_DIM + 3 * CARD_DIM + CHOICE_DIM + MAP_DIM
 
 # Flags for the persistent (logged-in) profile: Google refuses sign-in from browsers
 # that announce they are automated.
@@ -98,6 +101,7 @@ class PokeSurvivorEnv(gym.Env):
         # account needs the real domain for its sign-in
         self.mirror = (not profile_dir) if mirror is None else mirror
         self.last_meta: dict = {}
+        self._rift_d = None
         self.last_mask = np.ones(N_ACTIONS, bool)
         self._hist = []
         # skip canvas drawing when nobody watches (headless training without video)
@@ -205,10 +209,19 @@ class PokeSurvivorEnv(gym.Env):
         cur = grid.reshape(N_SECT, N_CH)[:, :HIST_CH].ravel()
         if not self._hist:
             self._hist = [np.zeros_like(cur)] * N_HIST
-        v = np.concatenate([grid, *self._hist, o["feats"], o["near"], o["slots"], o["cards"]]).astype(np.float32)
+        v = np.concatenate([grid, *self._hist, o["feats"], o["near"], o["slots"], o["cards"], o["choice"], o["map"]]).astype(np.float32)
         if o["feats"][14] < 0.5:  # not a menu step: time moved, shift the history
             self._hist = [cur] + self._hist[:-1]
         return np.clip(v, -1.0, 1.0)
+
+    def _rift_shaping(self, feats) -> float:
+        """Reward for closing in on an open rift (it lives 45 s, 380-560 units away).
+        feats[26:29] = rift exists, dx, dy (in units of 900, see riftFeats in bridge.js)."""
+        d = float(np.hypot(feats[27], feats[28])) if feats[26] > 0 else None
+        prev, self._rift_d = self._rift_d, d
+        if d is None or prev is None:
+            return 0.0
+        return 3.0 * (prev - d)  # ~1.5 total for walking from 450 units away to the rift
 
     def action_masks(self) -> np.ndarray:
         return self.last_mask
@@ -245,6 +258,7 @@ class PokeSurvivorEnv(gym.Env):
         self.last_mask = np.asarray(r["mask"], bool)
         self._save_progress()
         self._hist = []
+        self._rift_d = None
         self._t_last = time.perf_counter()
         return self._obs(r["obs"]), {"meta": self.last_meta, "start_time": start_time}
 
@@ -266,9 +280,12 @@ class PokeSurvivorEnv(gym.Env):
             + 0.03 * r["dKills"]
             + 1.0 * r["dProgress"]            # XP collected, 1.0 per full level
             + 5.0 * r["dBoss"]                # map bosses (rifts only open when none is alive)
-            + 3.0 * r["dRiftIn"]              # stepped into a rift
-            + 20.0 * r["dRiftWon"]            # beat the legendary: bond + loot
+            + 8.0 * r["dRiftIn"]              # stepped into a rift
+            + 40.0 * r["dRiftWon"]            # beat the legendary: bond + loot (top priority)
             - 3.0 * r["dRiftLost"]
+            + self._rift_shaping(r["obs"]["feats"])
+            + 6.0 * r["dBigChest"]            # big chest: coins + gacha tickets
+            + 0.5 * r["dChest"]
         )
         terminated = bool(r["done"])
         if terminated:

@@ -11,17 +11,27 @@ import argparse
 import itertools
 import json
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
 
-from pokesurvivor_rl.env import PokeSurvivorEnv
+from pokesurvivor_rl.env import OBS_DIM, PokeSurvivorEnv
+
+
+def checkpoint_obs_dim(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            return json.loads(z.read("data"))["observation_space"]["_shape"][0]
+    except Exception:  # still being written, or not an SB3 checkpoint
+        return None
 
 
 def latest_checkpoint():
     files = sorted(Path("checkpoints").glob("maskppo*/*.zip"), key=lambda f: f.stat().st_mtime)
-    if files:
-        return files[-1]
+    for f in reversed(files):
+        if checkpoint_obs_dim(f) == OBS_DIM:  # skip checkpoints from before the obs grew
+            return f
     best = Path("models/best.zip")  # shipped with the repo
     return best if best.exists() else None
 

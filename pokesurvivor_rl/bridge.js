@@ -65,7 +65,8 @@
     const a = (i / N_SECT) * Math.PI * 2;
     DIRS.push([Math.cos(a), Math.sin(a)]);
   }
-  // actions: 0 idle, 1-8 move, 9-11 pick level-up card, 12-15 switch active move slot
+  // actions: 0 idle, 1-8 move, 9-11 pick an option of the open menu (level-up card,
+  // move bond, held-item swap), 12-15 switch active move slot
   const N_ACTIONS = 16;
   const MOVES = [[0, 0]];
   for (let i = 0; i < 8; i++) {
@@ -79,16 +80,30 @@
   const CARD_DIM = CARD_TYPES.length + STATS.length + 1 + KINDS.length + 5;
   const SLOT_DIM = 4 + KINDS.length + 2;
   const FEAT_DIM = 36;
+  const ITEMS = ["leftovers", "choiceband", "quickclaw", "focussash", "shellbell", "amuletcoin",
+                 "luckyegg", "lifeorb", "choicescarf", "rockyhelmet", "assaultvest"];
+  const CHOICE_KINDS = ["card", "bond", "item"];
+  const BOND_DIM = KINDS.length + 4;
+  const OPT_DIM = BOND_DIM + ITEMS.length;
+  const CHOICE_DIM = CHOICE_KINDS.length + ITEMS.length + 3 * OPT_DIM;
+  // map objects per sector: 0 big chest (stand next to it 3.5 s: coins, gacha tickets),
+  // 1 small chest (break it), 2 grass (breaking it sometimes drops healing),
+  // 3 spring / altar (heal / power-up), 4 trap; then nearest big chest, small chest
+  // and spring/altar further away
+  const MAP_CH = 5;
+  const MAP_DIM = N_SECT * MAP_CH + 10;
   const FAR = 900;            // range for rift / boss direction features
 
   let axis = [0, 0];
   let hooked = false;
-  let pending = null;        // level-up waiting for the agent: {options, cb}
-  let learnCards = true;     // false: heuristic picks cards (old models)
+  // menus waiting for the agent, oldest first: {kind: card|bond|item, options, cb}
+  let pendingQ = [];
+  let learnCards = true;     // false: heuristic picks cards / bonds / items (old models)
   let ranking = false;       // submit results to the public leaderboard (account play only)
   let realRanking = null;
   let lastPos = null;
   let riftsEntered = 0, riftsWon = 0, riftsLost = 0, wasInArena = false;
+  let chests = 0, bigChests = 0;
 
   function sectorOf(dx, dy) {
     let a = Math.atan2(dy, dx);
@@ -122,22 +137,48 @@
     return best;
   }
 
+  // up to 3 bond choices: which loose move joins the existing group ("add"), or which
+  // two loose moves form a new group ("pair"); moves of the active slot come first
+  function bondCandidates(opt, h) {
+    const act = h.activeGroup();
+    const dps = (m) => ((m.dmg || 0) * (m.count || 1)) / Math.max(0.15, m.cd || 1);
+    const score = (ms) => ms.reduce((a, m) => a + dps(m) + (act.includes(m) ? 1e4 : 0), 0);
+    let c;
+    if (opt.mode === "add") {
+      c = opt.loose.map((m) => ({ moves: [m], group: opt.group.concat([m]) }));
+    } else {
+      c = [];
+      for (let i = 0; i < opt.loose.length; i++)
+        for (let j = i + 1; j < opt.loose.length; j++)
+          c.push({ moves: [opt.loose[i], opt.loose[j]], group: [opt.loose[i], opt.loose[j]] });
+    }
+    c.sort((a, b) => score(b.group) - score(a.group));
+    return c.slice(0, 3);
+  }
+
   function hookUI() {
     if (hooked) return;
     hooked = true;
     G.RunUI.showLevelUp = (lvl, options, cb) => {
       const h = G.Game.player;
-      if (learnCards && h) { pending = { options, cb }; return; }
+      if (learnCards && h) { pendingQ.push({ kind: "card", options, cb }); return; }
       const i = heuristicPick(options, h);
       RL.picks.push(options[i].key);
       cb(options[i]);
     };
     G.RunUI.showBond = (opt, cb) => {
-      // always fuse: bonded moves fire together
-      if (opt.mode === "add") cb([opt.loose[0]]);
-      else cb([opt.loose[0], opt.loose[1]]);
+      // bonded moves fire together; the agent picks which moves to fuse
+      if (!learnCards || !G.Game.player) {
+        if (opt.mode === "add") cb([opt.loose[0]]);
+        else cb([opt.loose[0], opt.loose[1]]);
+        return;
+      }
+      pendingQ.push({ kind: "bond", options: bondCandidates(opt, G.Game.player), cb: (c) => cb(c.moves) });
     };
-    G.RunUI.showItemChoice = (cur, neu, cb) => cb(neu);
+    G.RunUI.showItemChoice = (cur, neu, cb) => {
+      if (!learnCards || !G.Game.player) { cb(neu); return; }
+      pendingQ.push({ kind: "item", options: [{ id: cur }, { id: neu }], cb: (o) => cb(o.id) });
+    };
     // leaderboard / profile only when explicitly enabled (logged-in account play),
     // never from training
     realRanking = { submitSolo: G.Ranking.submitSolo, runStarted: G.Ranking.runStarted,
@@ -152,9 +193,11 @@
     const realEvent = G.Progress.event;
     G.Progress.event = function (name, data) {
       if (name === "rift") riftsWon++;
+      if (name === "chest") { bigChests++; chests--; } // big chest (its sound was counted too)
       return realEvent.apply(this, arguments);
     };
-    try { G.Audio.music = () => {}; G.Audio.sfx = () => {}; } catch (e) {}
+    // silent, but chests break inside the game's world module: count them by their sound
+    try { G.Audio.music = () => {}; G.Audio.sfx = (name) => { if (name === "chest") chests++; }; } catch (e) {}
   }
 
   // --------------------------------------------------------------- meta game
@@ -309,13 +352,78 @@
     return f;
   }
 
+  function mapFeat(h) {
+    const f = new Array(MAP_DIM).fill(0);
+    if (!h) return f;
+    const near = [null, null, null], nd = [Infinity, Infinity, Infinity];
+    const add = (o, ch, far) => {
+      const dx = o.x - h.x, dy = o.y - h.y, d = Math.hypot(dx, dy);
+      if (far >= 0 && d < nd[far]) { nd[far] = d; near[far] = o; }
+      if (d > SENSE) return;
+      const k = sectorOf(dx, dy) * MAP_CH + ch;
+      f[k] = Math.max(f[k], 1 - d / SENSE);
+    };
+    for (const o of G.World.propsInCircle(h.x, h.y, FAR)) {
+      if (o.type === "chest") add(o, 1, 1);
+      else if (o.type === "grass") add(o, 2, -1);
+    }
+    for (const o of G.World.specialsNear(h.x, h.y, FAR)) {
+      if (o.type === "bigchest") add(o, 0, 0);
+      else if (o.type === "trap") add(o, 4, -1);
+      else if ((o.type === "altar" && !o.used) || (o.type === "spring" && o.charge > 0.15)) add(o, 3, 2);
+    }
+    let at = N_SECT * MAP_CH;
+    near.forEach((o, i) => {
+      if (o) {
+        f[at] = 1;
+        f[at + 1] = Math.max(-1, Math.min(1, (o.x - h.x) / FAR));
+        f[at + 2] = Math.max(-1, Math.min(1, (o.y - h.y) / FAR));
+      }
+      at += 3;
+    });
+    f[at] = near[0] ? Math.min(1, (near[0].open || 0) / 3.5) : 0;
+    return f;
+  }
+
+  function choiceFeat(h) {
+    const f = new Array(CHOICE_DIM).fill(0);
+    if (!h) return f;
+    ITEMS.forEach((id, i) => { f[CHOICE_KINDS.length + i] = h.item === id ? 1 : 0; });
+    const p = pendingQ[0];
+    if (!p) return f;
+    f[CHOICE_KINDS.indexOf(p.kind)] = 1;
+    const base = CHOICE_KINDS.length + ITEMS.length;
+    p.options.slice(0, 3).forEach((o, i) => {
+      const at = base + i * OPT_DIM;
+      if (p.kind === "bond") {
+        const act = h.activeGroup();
+        let dps = 0, lvl = 0;
+        for (const m of o.group) {
+          const k = KINDS.indexOf(m.kind);
+          if (k >= 0) f[at + k] = 1;
+          dps += ((m.dmg || 0) * (m.count || 1)) / Math.max(0.15, m.cd || 1);
+          lvl += m.lvl || 1;
+        }
+        f[at + KINDS.length] = Math.min(1, dps / 200);
+        f[at + KINDS.length + 1] = Math.min(1, lvl / 20);
+        f[at + KINDS.length + 2] = o.group.length / 4;
+        f[at + KINDS.length + 3] = o.group.some((m) => act.includes(m)) ? 1 : 0;
+      } else if (p.kind === "item") {
+        const k = ITEMS.indexOf(o.id);
+        if (k >= 0) f[at + BOND_DIM + k] = 1;
+      }
+    });
+    return f;
+  }
+
   function observe() {
     const h = G.Game.player;
     const grid = new Float32Array(N_SECT * C);
     const near = new Float32Array(8 * 4);
     const slots = new Array(4 * SLOT_DIM).fill(0);
     const cards = new Array(3 * CARD_DIM).fill(0);
-    if (!h) return { grid: Array.from(grid), feats: new Array(FEAT_DIM).fill(0), near: Array.from(near), slots, cards };
+    if (!h) return { grid: Array.from(grid), feats: new Array(FEAT_DIM).fill(0), near: Array.from(near), slots, cards,
+                     choice: choiceFeat(h), map: mapFeat(h) };
     const px = h.x, py = h.y;
     const enemies = [];
     let bossAlive = 0;
@@ -382,7 +490,8 @@
       slots.splice(i * SLOT_DIM, SLOT_DIM, 1, i === h.active ? 1 : 0, g.length / 4, Math.min(1, lvl / 20),
         ...oneHot(KINDS, lead && lead.kind), g.some((m) => m.evolved) ? 1 : 0, Math.min(1, dps / 200));
     });
-    if (pending) pending.options.slice(0, 3).forEach((o, i) => cards.splice(i * CARD_DIM, CARD_DIM, ...cardFeat(o, h)));
+    const p = pendingQ[0];
+    if (p && p.kind === "card") p.options.slice(0, 3).forEach((o, i) => cards.splice(i * CARD_DIM, CARD_DIM, ...cardFeat(o, h)));
     // how much of the commanded movement actually happened (blocked by a wall -> low)
     let moved = 1;
     if (lastPos && (axis[0] || axis[1])) {
@@ -405,7 +514,7 @@
       bossAlive,
       G.Rift.inArena ? 1 : 0,
       Math.min(1, h.slots.length / 4),
-      pending ? 1 : 0,
+      pendingQ.length ? 1 : 0,
       moved,
       Math.min(1, d.hp / 200),
       Math.min(1, d.atk / 2),
@@ -419,7 +528,7 @@
       Math.min(1, (G.Game.st.time % 240) / 240),
       ...riftFeats(h),
     ];
-    return { grid: Array.from(grid), feats, near: Array.from(near), slots, cards };
+    return { grid: Array.from(grid), feats, near: Array.from(near), slots, cards, choice: choiceFeat(h), map: mapFeat(h) };
   }
 
   // rift (portal to a legendary fight) and the nearest map boss, often beyond SENSE
@@ -455,8 +564,8 @@
   function actionMask() {
     const m = new Array(N_ACTIONS).fill(false);
     const h = G.Game.player;
-    if (pending) {
-      for (let i = 0; i < Math.min(3, pending.options.length); i++) m[9 + i] = true;
+    if (pendingQ.length) {
+      for (let i = 0; i < Math.min(3, pendingQ[0].options.length); i++) m[9 + i] = true;
       return m;
     }
     for (let i = 0; i < 9; i++) m[i] = true;
@@ -474,7 +583,7 @@
       progress: h.level - 1 + (h.xpNext ? Math.min(1, h.xp / h.xpNext) : 0),
       moves: h.moves.map((m) => m.id + ":" + m.lvl + (m.evolved ? "*" : "")),
       partner: (G.DEX_BY[h.dex] || {}).name || String(h.dex),
-      riftsEntered, riftsWon, riftsLost, inArena: G.Rift.inArena,
+      riftsEntered, riftsWon, riftsLost, inArena: G.Rift.inArena, chests, bigChests,
     };
   }
 
@@ -494,9 +603,11 @@
       dRiftIn: after.riftsEntered - before.riftsEntered,
       dRiftWon: after.riftsWon - before.riftsWon,
       dRiftLost: after.riftsLost - before.riftsLost,
+      dChest: after.chests - before.chests,
+      dBigChest: after.bigChests - before.bigChests,
       dt: after.time - before.time,
       done: !h || h !== h0 || (h.dead && !G.Rift.inArena) || G.Game.state === "over",
-      choice: !!pending,
+      choice: pendingQ.length > 0,
     };
   }
 
@@ -531,7 +642,7 @@
       learnCards = opts.learnCards !== false;
       // only a real logged-in account may ever reach the leaderboard
       ranking = !!opts.ranking && G.DB.loggedIn && !G.DB.guest && !(opts.startTime > 0);
-      pending = null;
+      pendingQ = [];
       // finish the previous run properly so the game pays out its coins / tickets
       if (G.Game.player && G.Game.state !== "ui" && G.Game.state !== "over") G.Game.quit();
       G.UI.hideAll();
@@ -571,6 +682,7 @@
       axis = [0, 0];
       lastPos = null;
       riftsEntered = riftsWon = riftsLost = 0;
+      chests = bigChests = 0;
       wasInArena = false;
       RL.picks = [];
       // curriculum: jump ahead in time with a matching number of level-ups
@@ -586,14 +698,16 @@
       const h0 = G.Game.player;
       const before = stats();
       let hpLost = 0;
-      if (pending) {
-        // level-up card choice (time is frozen while the menu is open)
-        const p = pending;
-        pending = null;
-        const i = action >= 9 && action <= 11 && action - 9 < p.options.length ? action - 9 : heuristicPick(p.options, h0);
-        RL.picks.push(p.options[i].key);
-        p.cb(p.options[i]);
-        pump(1); // lets the game raise the next queued level-up, if any
+      if (pendingQ.length) {
+        // menu choice: level-up card, bond or item swap (time is frozen while it is open)
+        const p = pendingQ.shift();
+        const fallback = p.kind === "card" ? heuristicPick(p.options, h0) : p.kind === "item" ? 1 : 0;
+        const i = action >= 9 && action <= 11 && action - 9 < p.options.length ? action - 9 : fallback;
+        const o = p.options[i];
+        RL.picks.push(p.kind === "card" ? o.key : p.kind === "item" ? "item:" + o.id
+                      : "bond:" + o.group.map((m) => m.id).join("+"));
+        p.cb(o);
+        if (!pendingQ.length) pump(1); // lets the game raise the next queued menu, if any
         return result(before, 0, h0);
       }
       if (action >= 12 && action <= 15) {
@@ -611,7 +725,7 @@
         if (inArena && !wasInArena) riftsEntered++;
         if (!inArena && wasInArena && riftsWon + riftsLost < riftsEntered) riftsLost++;
         wasInArena = inArena;
-        if (G.Game.state === "over" || (h.dead && !inArena) || pending) break;
+        if (G.Game.state === "over" || (h.dead && !inArena) || pendingQ.length) break;
       }
       return result(before, hpLost, h0);
     },
@@ -627,6 +741,6 @@
     observe,
     actionMask,
     stats,
-    dims: { N_SECT, C, FEAT_DIM, SLOT_DIM, CARD_DIM, N_ACTIONS },
+    dims: { N_SECT, C, FEAT_DIM, SLOT_DIM, CARD_DIM, CHOICE_DIM, MAP_DIM, N_ACTIONS },
   };
 })();
