@@ -28,7 +28,6 @@ def main():
             viewport={"width": 960, "height": 540})
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(GAME_URL, wait_until="load")
-        print("請在打開的瀏覽器視窗中登入 PokeSurvivor（Google 或遊戲帳號）…")
         print("Sign in inside the browser window (Google or a game account)...")
         deadline = time.time() + args.timeout
         user = None
@@ -42,9 +41,9 @@ def main():
             time.sleep(1)
         if user:
             time.sleep(3)  # let the cloud save finish loading
-            print(f"登入成功 / logged in as: {user}")
+            print(f"Logged in as: {user}")
         else:
-            print("沒有偵測到登入 / no login detected (timed out)")
+            print("No login detected (timed out)")
         ctx.close()
 
 
