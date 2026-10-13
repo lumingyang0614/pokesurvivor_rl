@@ -188,6 +188,45 @@
            (1 + 0.5 * p.crit) / (1 - p.dmgReduce);
   }
 
+  function upgradesMaxed(dex) {
+    const ups = (G.DB.save.pupg && G.DB.save.pupg[dex]) || {};
+    return Object.keys(UPGRADE_WANT).every((id) => (ups[id] || 0) >= G.Upgrades.BY[id].max);
+  }
+
+  // base-stat potential (as if fully upgraded): used to pick an investment target
+  function basePotential(dex) {
+    const d = G.DEX_BY[dex];
+    return d ? d.hp * d.atk * Math.sqrt(d.spd) : 0;
+  }
+
+  // "Farm with the current partner, invest in a target, switch once it is maxed":
+  // coins go to the current partner until its upgrades are maxed, then into the
+  // target; when the target is maxed too, it becomes the partner.
+  function investPlan(target) {
+    const save = G.DB.save, cur = save.partner, out = { target: null, bought: [], switched: false };
+    if (target === "auto") {
+      let best = null, bp = basePotential(cur) * 1.15;
+      for (const k of Object.keys(save.owned || {})) {
+        const dex = +k;
+        if (dex === cur || !G.DEX_BY[dex] || !G.SPRITE_META[dex]) continue;
+        const p = basePotential(dex);
+        if (p > bp) { bp = p; best = dex; }
+      }
+      target = best;
+    }
+    target = target ? +target : null;
+    out.bought = autoUpgrade(cur);
+    if (!target || target === cur || !G.DB.owns(target) || !upgradesMaxed(cur)) return out;
+    out.target = (G.DEX_BY[target] || {}).name;
+    out.bought.push(...autoUpgrade(target).map((b) => out.target + ":" + b));
+    if (upgradesMaxed(target)) {
+      save.partner = target;
+      save.partnerShiny = !!(save.shiny && save.shiny[target]);
+      out.switched = true;
+    }
+    return out;
+  }
+
   function claimMissions() {
     const save = G.DB.save, got = [];
     if (!save.missions || !G.Progress.claim) return got;
@@ -502,8 +541,15 @@
       if (opts.meta) {
         meta.claimed = claimMissions();
         meta.pulls = gacha();
-        if (opts.choosePartner !== false) choosePartner();
-        meta.bought = autoUpgrade(G.DB.save.partner);
+        if (opts.invest) {
+          const plan = investPlan(opts.invest);
+          meta.bought = plan.bought;
+          meta.investTarget = plan.target;
+          meta.switched = plan.switched;
+        } else {
+          if (opts.choosePartner !== false) choosePartner();
+          meta.bought = autoUpgrade(G.DB.save.partner);
+        }
         if (G.DB.commit) G.DB.commit(true);
       }
       meta.partner = (G.DEX_BY[G.DB.save.partner] || {}).name;

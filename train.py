@@ -15,6 +15,8 @@ from pokesurvivor_rl.env import PokeSurvivorEnv
 
 def make_env(rank, partner, frame_skip, curriculum, switch_partner):
     def _thunk():
+        import time
+        time.sleep(2.0 * rank)  # stagger page loads so the site is not hit all at once
         return PokeSurvivorEnv(headless=True, partner=partner, frame_skip=frame_skip,
                                curriculum=curriculum, choose_partner=switch_partner,
                                save_path=f"progress/train_env{rank}.json")

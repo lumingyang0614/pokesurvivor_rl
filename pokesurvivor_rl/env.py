@@ -57,6 +57,7 @@ class PokeSurvivorEnv(gym.Env):
         save_path: str | None = None,
         profile_dir: str | None = None,
         ranking: bool = False,
+        invest: str | int | None = None,
         record_dir: str | None = None,
         viewport=(960, 540),
     ):
@@ -85,6 +86,8 @@ class PokeSurvivorEnv(gym.Env):
         self.account_user = None
         # leaderboard submissions: only ever for a logged-in account, never for guests
         self.ranking = bool(ranking and profile_dir)
+        # coin plan: None (upgrade current partner), "auto" or a Pokedex number to invest in
+        self.invest = invest
         self.last_meta: dict = {}
         self.last_mask = np.ones(N_ACTIONS, bool)
         self._hist = []
@@ -98,7 +101,18 @@ class PokeSurvivorEnv(gym.Env):
         self.last_stats: dict = {}
 
     # ------------------------------------------------------------------ browser
-    def _launch(self):
+    def _launch(self, attempts: int = 4):
+        for i in range(attempts):
+            try:
+                return self._launch_once()
+            except Exception as e:
+                print(f"[env] launch failed ({str(e).splitlines()[0][:120]}), retry {i + 1}/{attempts}")
+                self.close()
+                if i == attempts - 1 or "Not logged in" in str(e):
+                    raise
+                time.sleep(5 * (i + 1))
+
+    def _launch_once(self):
         self._pw = sync_playwright().start()
         with socket.socket() as sk:
             sk.bind(("127.0.0.1", 0))
@@ -123,9 +137,11 @@ class PokeSurvivorEnv(gym.Env):
         self.page.goto(GAME_URL, wait_until="load", timeout=120_000)
         # boot needs animation frames for fonts/UI; pump until the game objects exist
         for _ in range(600):
-            if self.page.evaluate("() => window.RL && RL.ready() && !!G.DB && G.DB.ready && true"):
+            if self.page.evaluate("() => !!(window.RL && RL.ready() && G.DB && G.DB.ready)"):
                 break
             time.sleep(0.1)
+        else:
+            raise RuntimeError("game did not load")
         # wait for the DB to finish its async ready() (tap-to-start screen shows up)
         for _ in range(600):
             ok = self.page.evaluate(
@@ -207,6 +223,7 @@ class PokeSurvivorEnv(gym.Env):
             start_levels = int(round(self.level_rate * start_time / 60))
         self._cur_start = start_time
         opts = dict(meta=self.meta, choosePartner=self.choose_partner, learnCards=True, ranking=self.ranking,
+                    invest=self.invest,
                     startTime=start_time, startLevels=start_levels)
         if options:
             opts.update(options)
