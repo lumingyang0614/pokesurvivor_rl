@@ -541,20 +541,31 @@
       if (opts.meta) {
         meta.claimed = claimMissions();
         meta.pulls = gacha();
+        // favourites the user wants levelled first; they get coins before the partner,
+        // but the partner itself stays unchanged
+        for (const fav of opts.favorites || []) {
+          if (+fav === G.DB.save.partner || !G.DB.owns(+fav)) continue;
+          const name = (G.DEX_BY[+fav] || {}).name;
+          meta.bought.push(...autoUpgrade(+fav).map((b) => name + ":" + b));
+        }
         if (opts.invest) {
           const plan = investPlan(opts.invest);
-          meta.bought = plan.bought;
+          meta.bought.push(...plan.bought);
           meta.investTarget = plan.target;
           meta.switched = plan.switched;
         } else {
           if (opts.choosePartner !== false) choosePartner();
-          meta.bought = autoUpgrade(G.DB.save.partner);
+          meta.bought.push(...autoUpgrade(G.DB.save.partner));
         }
         if (G.DB.commit) G.DB.commit(true);
       }
       meta.partner = (G.DEX_BY[G.DB.save.partner] || {}).name;
       meta.coins = G.DB.save.coins;
       meta.tickets = G.DB.save.tickets;
+      meta.owned = Object.keys(G.DB.save.owned || {}).length;
+      meta.legendaries = Object.keys(G.DB.save.owned || {})
+        .map((k) => G.DEX_BY[+k]).filter((d) => d && d.leg)
+        .map((d) => d.name + (G.DB.save.shiny && G.DB.save.shiny[d.dex] ? "*" : ""));
       meta.upgrades = (G.DB.save.pupg || {})[G.DB.save.partner] || {};
       G.Game.startRun();
       axis = [0, 0];

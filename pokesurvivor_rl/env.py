@@ -60,6 +60,7 @@ class PokeSurvivorEnv(gym.Env):
         profile_dir: str | None = None,
         ranking: bool = False,
         invest: str | int | None = None,
+        favorites: list[int] | None = None,
         mirror: bool | None = None,
         record_dir: str | None = None,
         viewport=(960, 540),
@@ -91,6 +92,8 @@ class PokeSurvivorEnv(gym.Env):
         self.ranking = bool(ranking and profile_dir)
         # coin plan: None (upgrade current partner), "auto" or a Pokedex number to invest in
         self.invest = invest
+        # Pokedex numbers whose upgrades get coins before the partner (partner is not switched)
+        self.favorites = list(favorites or [])
         # load the game from the local cached mirror (default for guests); a logged-in
         # account needs the real domain for its sign-in
         self.mirror = (not profile_dir) if mirror is None else mirror
@@ -231,6 +234,7 @@ class PokeSurvivorEnv(gym.Env):
         self._cur_start = start_time
         opts = dict(meta=self.meta, choosePartner=self.choose_partner, learnCards=True, ranking=self.ranking,
                     invest=self.invest,
+                    favorites=self.favorites,
                     startTime=start_time, startLevels=start_levels)
         if options:
             opts.update(options)

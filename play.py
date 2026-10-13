@@ -48,6 +48,9 @@ def main():
                    help="do not claim missions / pull gacha / switch partner / buy upgrades")
     p.add_argument("--auto-partner", action="store_true",
                    help="switch to the strongest owned partner between runs (default: keep the partner)")
+    p.add_argument("--favorites", type=str, default="",
+                   help="comma-separated Pokedex numbers to upgrade first whenever owned "
+                        "(e.g. 909,113); the partner is not switched")
     p.add_argument("--invest", type=str, default=None,
                    help="'auto' or a Pokedex number: max the current partner first, then put coins into "
                         "this Pokemon and switch to it once its upgrades are maxed")
@@ -79,7 +82,8 @@ def main():
                           choose_partner=args.auto_partner,
                           profile_dir="browser_profile" if args.account else None,
                           ranking=args.account and not args.no_ranking,
-                          invest=args.invest)
+                          invest=args.invest,
+                          favorites=[int(x) for x in args.favorites.split(",") if x.strip()])
     rng = np.random.default_rng()
     try:
         for ep in (itertools.count() if args.episodes == 0 else range(args.episodes)):
@@ -93,6 +97,8 @@ def main():
                 print("   missions claimed:", ", ".join(meta["claimed"]))
             if meta.get("pulls"):
                 print("   gacha:", ", ".join(meta["pulls"]))
+            print(f"   owned: {meta.get('owned')} Pokemon | legendaries: "
+                  f"{', '.join(meta.get('legendaries') or []) or 'none yet'}")
             if meta.get("investTarget"):
                 print("   investing in:", meta["investTarget"], "(switched!)" if meta.get("switched") else "")
             if meta.get("bought"):
