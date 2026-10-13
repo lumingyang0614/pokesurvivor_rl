@@ -1,7 +1,8 @@
 // Injected into pokesurvivor.com before any game script runs.
 // - Takes over requestAnimationFrame so Python can step the game deterministically
 //   (fixed 1/30 s frames, as fast as the CPU allows).
-// - Exposes window.RL with reset / step / observe helpers.
+// - Exposes window.RL: reset / step / observe / action mask, plus the between-run
+//   "meta" (missions, gacha, partner choice, permanent upgrades).
 (() => {
   const FRAME_MS = 1000 / 30;
   const realRAF = window.requestAnimationFrame.bind(window);
@@ -51,35 +52,52 @@
     }
   }
 
+  // ------------------------------------------------------------------ constants
   const N_SECT = 16;
-  const SENSE = 360;        // world units the agent "sees"
-  const WALL_RANGE = 160;
+  const SENSE = 360;          // world units the agent "sees"
+  const TERRAIN_RANGE = 192;  // how far walls / liquid are probed
+  const C = 9;                // grid channels per sector
+  // 0 enemy proximity, 1 enemy density, 2 hostile projectiles, 3 xp/coins,
+  // 4 special pickups, 5 walls & solid props, 6 liquid (water slows, lava hurts),
+  // 7 telegraphed hazards, 8 boss
   const DIRS = [];
   for (let i = 0; i < N_SECT; i++) {
     const a = (i / N_SECT) * Math.PI * 2;
     DIRS.push([Math.cos(a), Math.sin(a)]);
   }
-  // 8-way movement + idle
-  const ACTIONS = [[0, 0]];
+  // actions: 0 idle, 1-8 move, 9-11 pick level-up card, 12-15 switch active move slot
+  const N_ACTIONS = 16;
+  const MOVES = [[0, 0]];
   for (let i = 0; i < 8; i++) {
     const a = (i / 8) * Math.PI * 2;
-    ACTIONS.push([Math.cos(a), Math.sin(a)]);
+    MOVES.push([Math.cos(a), Math.sin(a)]);
   }
+  const KINDS = ["melee", "dash", "buff", "projectile", "cone", "orbit", "nova", "beam",
+                 "boomerang", "aura", "chain", "trail", "mine", "meteor", "turret"];
+  const STATS = ["hp", "atk", "spd", "cd", "def", "rgn", "mag", "xp", "heal"];
+  const CARD_TYPES = ["new", "up", "evo", "stat"];
+  const CARD_DIM = CARD_TYPES.length + STATS.length + 1 + KINDS.length + 5;
+  const SLOT_DIM = 4 + KINDS.length + 2;
+  const FEAT_DIM = 36;
+  const FAR = 900;            // range for rift / boss direction features
 
   let axis = [0, 0];
   let hooked = false;
-  let prev = null;
-  let lastSlotSwitch = 0;
+  let pending = null;        // level-up waiting for the agent: {options, cb}
+  let learnCards = true;     // false: heuristic picks cards (old models)
+  let ranking = false;       // submit results to the public leaderboard (account play only)
+  let realRanking = null;
+  let lastPos = null;
+  let riftsEntered = 0, riftsWon = 0, riftsLost = 0, wasInArena = false;
 
   function sectorOf(dx, dy) {
     let a = Math.atan2(dy, dx);
     if (a < 0) a += Math.PI * 2;
     return Math.floor((a / (Math.PI * 2)) * N_SECT + 0.5) % N_SECT;
   }
+  function oneHot(list, v) { return list.map((x) => (x === v ? 1 : 0)); }
 
-  // ---- heuristics for the menus (the RL agent only controls movement) ----
-  // Only the active move slot fires (several moves share a slot only after a rare
-  // "bond"), so pour upgrades into the active move and global stats.
+  // ------------------------------------------------- heuristic fallbacks / menus
   const STAT_SCORE = { atk: 42, cd: 38, hp: 30, def: 30, mag: 28, rgn: 25, spd: 22, xp: 20, heal: 5 };
   function scoreOption(o, h) {
     const hpf = h.hp / h.maxHp;
@@ -92,8 +110,16 @@
     const id = o.key.slice(5);
     if (id === "heal") return hpf < 0.5 ? 90 : 5;
     if (id === "hp" && hpf < 0.5) return 50;
-    if (o.color === "#ffd23f") return 70; // stat that unlocks an evolution
+    if (o.color === "#ffd23f") return 70;
     return STAT_SCORE[id] || 10;
+  }
+  function heuristicPick(options, h) {
+    let best = 0, bs = -1;
+    options.forEach((o, i) => {
+      const s = scoreOption(o, h) + Math.random();
+      if (s > bs) { bs = s; best = i; }
+    });
+    return best;
   }
 
   function hookUI() {
@@ -101,13 +127,10 @@
     hooked = true;
     G.RunUI.showLevelUp = (lvl, options, cb) => {
       const h = G.Game.player;
-      let best = 0, bs = -1;
-      options.forEach((o, i) => {
-        const s = scoreOption(o, h) + Math.random();
-        if (s > bs) { bs = s; best = i; }
-      });
-      RL.picks.push(options[best].key);
-      cb(options[best]);
+      if (learnCards && h) { pending = { options, cb }; return; }
+      const i = heuristicPick(options, h);
+      RL.picks.push(options[i].key);
+      cb(options[i]);
     };
     G.RunUI.showBond = (opt, cb) => {
       // always fuse: bonded moves fire together
@@ -115,17 +138,26 @@
       else cb([opt.loose[0], opt.loose[1]]);
     };
     G.RunUI.showItemChoice = (cur, neu, cb) => cb(neu);
-    // never touch the public leaderboard / profile from training runs
-    G.Ranking.submitSolo = () => {};
+    // leaderboard / profile only when explicitly enabled (logged-in account play),
+    // never from training
+    realRanking = { submitSolo: G.Ranking.submitSolo, runStarted: G.Ranking.runStarted,
+                    publishProfile: G.Social && G.Social.publishProfile };
+    G.Ranking.submitSolo = function () { if (ranking) return realRanking.submitSolo.apply(this, arguments); };
+    G.Ranking.runStarted = function () { if (ranking) return realRanking.runStarted.apply(this, arguments); };
     G.Ranking.submitGroup = () => {};
-    G.Ranking.runStarted = () => {};
-    if (G.Social) G.Social.publishProfile = () => {};
+    if (G.Social) G.Social.publishProfile = function () {
+      if (ranking && realRanking.publishProfile) return realRanking.publishProfile.apply(this, arguments);
+    };
     G.Input.axis = () => axis;
+    const realEvent = G.Progress.event;
+    G.Progress.event = function (name, data) {
+      if (name === "rift") riftsWon++;
+      return realEvent.apply(this, arguments);
+    };
     try { G.Audio.music = () => {}; G.Audio.sfx = () => {}; } catch (e) {}
   }
 
-  // ---- permanent upgrades ("Mejoras" menu), bought with coins between runs ----
-  // weight = how much we want it; the cheapest cost/weight option is bought first.
+  // --------------------------------------------------------------- meta game
   const UPGRADE_WANT = { atk: 1.4, hp: 1.2, cd: 1.2, def: 1.0, magnet: 0.9, regen: 0.8,
                          crit: 0.9, spd: 0.6, xp: 0.7, coins: 0.5 };
   function autoUpgrade(dex) {
@@ -143,24 +175,59 @@
       ups[best] = (ups[best] || 0) + 1;
       bought.push(best + ">" + ups[best]);
     }
-    if (bought.length && G.DB.commit) G.DB.commit(true);
     return bought;
   }
 
-  function pickSlot(h) {
-    // fire the slot with the most total move levels
-    let best = h.active, bs = -1;
-    h.slots.forEach((g, i) => {
-      let s = 0;
-      for (const m of g) s += (m.kind === "buff" ? 0.5 : 1) * (m.lvl || 1) * (m.evolved ? 2 : 1);
-      if (s > bs + 0.01) { bs = s; best = i; }
-    });
-    if (best !== h.active && G.Game.st.time - lastSlotSwitch > 3) {
-      lastSlotSwitch = G.Game.st.time;
-      h.setActive(best);
-    }
+  // rough "how strong is this partner with its permanent upgrades"
+  function partnerPower(dex) {
+    const d = G.DEX_BY[dex];
+    if (!d) return 0;
+    const save = G.DB.save;
+    const p = G.Upgrades.perks((save.pupg && save.pupg[dex]) || {});
+    return (d.hp + p.hp) * d.atk * p.atkMul / p.cdMul * Math.sqrt(d.spd * p.spdMul) *
+           (1 + 0.5 * p.crit) / (1 - p.dmgReduce);
   }
 
+  function claimMissions() {
+    const save = G.DB.save, got = [];
+    if (!save.missions || !G.Progress.claim) return got;
+    try { G.Progress.ensure && G.Progress.ensure(save); } catch (e) {}
+    for (const [list, weekly] of [[save.missions.daily || [], false], [save.missions.weekly || [], true]]) {
+      for (const m of list) {
+        try { if (G.Progress.claim(m, weekly)) got.push(m.id); } catch (e) {}
+      }
+    }
+    return got;
+  }
+
+  function gacha() {
+    const save = G.DB.save, got = [];
+    save.tickets = save.tickets || { t1: 0, t10: 0 };
+    const gen = 1 + Math.floor(Math.random() * G.Gacha.BANNERS.length);
+    const take = (res) => { for (const r of res || []) got.push((G.DEX_BY[r.dex] || {}).name + (r.shiny ? "*" : "") + ":" + r.rarity); };
+    while (save.tickets.t10 >= 1) take(G.Gacha.pull(save, 10, gen, "t10"));
+    while (save.tickets.t1 >= 10) take(G.Gacha.pull(save, 10, gen, "t1"));
+    while (save.tickets.t1 >= 1) take(G.Gacha.pull(save, 1, gen, "t1"));
+    return got;
+  }
+
+  function choosePartner() {
+    const save = G.DB.save;
+    let best = save.partner, bp = partnerPower(save.partner) * 1.1; // switching has to be clearly better
+    for (const k of Object.keys(save.owned || {})) {
+      const dex = +k;
+      if (!G.DEX_BY[dex] || !G.SPRITE_META[dex]) continue;
+      const p = partnerPower(dex);
+      if (p > bp) { bp = p; best = dex; }
+    }
+    if (best !== save.partner) {
+      save.partner = best;
+      save.partnerShiny = !!(save.shiny && save.shiny[best]);
+    }
+    return best;
+  }
+
+  // ------------------------------------------------------------- observation
   function hazardAt(list, x, y, r) {
     for (const z of list) {
       if (z.kind === "zone") {
@@ -174,12 +241,42 @@
     return false;
   }
 
+  function moveFeat(def, inst, h) {
+    // def: static move data, inst: player's instance (or null for a new move)
+    const m = inst || def;
+    const dps = ((m.dmg || 0) * (m.count || 1)) / Math.max(0.15, m.cd || 1);
+    return [
+      ...oneHot(KINDS, m.kind),
+      Math.min(1, dps / 120),
+      inst ? (inst.lvl || 1) / (inst.maxLvl || 5) : 0,
+      inst && h.activeGroup().includes(inst) ? 1 : 0,
+      inst && inst.evolved ? 1 : 0,
+      m.kind === "buff" ? 1 : 0,
+    ];
+  }
+
+  function cardFeat(o, h) {
+    const f = [...oneHot(CARD_TYPES, o.type)];
+    const statId = o.type === "stat" ? o.key.slice(5) : null;
+    f.push(...oneHot(STATS, statId));
+    f.push(o.type === "stat" && o.color === "#ffd23f" ? 1 : 0); // unlocks an evolution
+    if (o.type === "stat") {
+      f.push(...new Array(KINDS.length + 5).fill(0));
+    } else {
+      const id = o.key.slice(o.key.indexOf(":") + 1);
+      const inst = h.moves.find((m) => m.id === id) || null;
+      f.push(...moveFeat(G.Moves.BY_ID[id] || {}, inst, h));
+    }
+    return f;
+  }
+
   function observe() {
     const h = G.Game.player;
-    const C = 8;
     const grid = new Float32Array(N_SECT * C);
     const near = new Float32Array(8 * 4);
-    if (!h) return { grid: Array.from(grid), feats: new Array(14).fill(0), near: Array.from(near) };
+    const slots = new Array(4 * SLOT_DIM).fill(0);
+    const cards = new Array(3 * CARD_DIM).fill(0);
+    if (!h) return { grid: Array.from(grid), feats: new Array(FEAT_DIM).fill(0), near: Array.from(near), slots, cards };
     const px = h.x, py = h.y;
     const enemies = [];
     let bossAlive = 0;
@@ -191,14 +288,13 @@
       const k = sectorOf(dx, dy) * C, p = 1 - d / SENSE;
       grid[k + 0] = Math.max(grid[k + 0], p);
       grid[k + 1] += 0.15 * p;
-      if (e.boss) grid[k + 7] = Math.max(grid[k + 7], p);
+      if (e.boss) grid[k + 8] = Math.max(grid[k + 8], p);
       enemies.push([d, dx, dy, e]);
     }
     for (const pr of G.Projectiles.all()) {
       if (pr.friendly) continue;
       const dx = pr.x - px, dy = pr.y - py, d = Math.hypot(dx, dy);
       if (d > SENSE) continue;
-      // weight by whether it is heading toward us
       const sp = Math.hypot(pr.vx, pr.vy) || 1;
       const toward = Math.max(0, -(dx * pr.vx + dy * pr.vy) / (d * sp + 1e-6));
       const k = sectorOf(dx, dy) * C;
@@ -211,17 +307,23 @@
       if (it.kind === "xp" || it.kind === "xpBig" || it.kind === "coin") grid[k + 3] = Math.max(grid[k + 3], p);
       else grid[k + 4] = Math.max(grid[k + 4], p);
     }
+    // terrain: walls / solid props and liquid, probed along 16 rays
+    const liq = G.World.liquidEffect(h.mon.types) || {};
+    const liqVal = liq.dmg ? 1 : liq.slow ? 0.5 : 0.15;
     const haz = G.Hazards.all || [];
     for (let i = 0; i < N_SECT; i++) {
       const [cx, cy] = DIRS[i];
-      let wall = 0;
-      for (let r = 20; r <= WALL_RANGE; r += 20) {
-        if (!G.World.isFree(px + cx * r, py + cy * r, h.r)) { wall = 1 - (r - 20) / WALL_RANGE; break; }
+      let wall = 0, water = 0;
+      for (let r = 16; r <= TERRAIN_RANGE; r += 16) {
+        const x = px + cx * r, y = py + cy * r, near = 1 - (r - 16) / TERRAIN_RANGE;
+        if (!water && G.World.isLiquid(x, y)) water = near * liqVal;
+        if (!G.World.isFree(x, y, h.r, true)) { wall = near; break; }
       }
       grid[i * C + 5] = wall;
+      grid[i * C + 6] = water;
       if (haz.length) {
         for (const r of [0, 40, 80, 130]) {
-          if (hazardAt(haz, px + cx * r, py + cy * r, h.r)) { grid[i * C + 6] = Math.max(grid[i * C + 6], 1 - r / 160); break; }
+          if (hazardAt(haz, px + cx * r, py + cy * r, h.r)) { grid[i * C + 7] = Math.max(grid[i * C + 7], 1 - r / 160); break; }
         }
       }
     }
@@ -234,6 +336,21 @@
       near[i * 4 + 2] = Math.min(1, e.dmg / Math.max(1, h.hp));
       near[i * 4 + 3] = e.maxHp ? e.hp / e.maxHp : 0;
     }
+    h.slots.slice(0, 4).forEach((g, i) => {
+      const lead = g[0];
+      const lvl = g.reduce((a, m) => a + (m.lvl || 1), 0);
+      const dps = g.reduce((a, m) => a + ((m.dmg || 0) * (m.count || 1)) / Math.max(0.15, m.cd || 1), 0);
+      slots.splice(i * SLOT_DIM, SLOT_DIM, 1, i === h.active ? 1 : 0, g.length / 4, Math.min(1, lvl / 20),
+        ...oneHot(KINDS, lead && lead.kind), g.some((m) => m.evolved) ? 1 : 0, Math.min(1, dps / 200));
+    });
+    if (pending) pending.options.slice(0, 3).forEach((o, i) => cards.splice(i * CARD_DIM, CARD_DIM, ...cardFeat(o, h)));
+    // how much of the commanded movement actually happened (blocked by a wall -> low)
+    let moved = 1;
+    if (lastPos && (axis[0] || axis[1])) {
+      const want = h.spd * 3 / 30;
+      moved = Math.min(1, Math.hypot(px - lastPos[0], py - lastPos[1]) / Math.max(1, want));
+    }
+    const d = h.mon;
     const feats = [
       h.hp / h.maxHp,
       Math.min(1, h.maxHp / 600),
@@ -249,8 +366,64 @@
       bossAlive,
       G.Rift.inArena ? 1 : 0,
       Math.min(1, h.slots.length / 4),
+      pending ? 1 : 0,
+      moved,
+      Math.min(1, d.hp / 200),
+      Math.min(1, d.atk / 2),
+      Math.min(1, d.spd / 200),
+      Math.min(1, (h.atkMul || 1) / 4),
+      Math.min(1, (h.cdMul || 1)),
+      Math.min(1, h.critChance || 0),
+      Math.min(1, (h.magnet || 78) / 300),
+      Math.min(1, (h.regen || 0) / 10),
+      h.item ? 1 : 0,
+      Math.min(1, (G.Game.st.time % 240) / 240),
+      ...riftFeats(h),
     ];
-    return { grid: Array.from(grid), feats, near: Array.from(near) };
+    return { grid: Array.from(grid), feats, near: Array.from(near), slots, cards };
+  }
+
+  // rift (portal to a legendary fight) and the nearest map boss, often beyond SENSE
+  function riftFeats(h) {
+    const f = new Array(10).fill(0);
+    const rift = G.Rift.rift, arena = G.Rift.arena;
+    if (rift) {
+      f[0] = 1;
+      f[1] = Math.max(-1, Math.min(1, (rift.x - h.x) / FAR));
+      f[2] = Math.max(-1, Math.min(1, (rift.y - 10 - h.y) / FAR));
+      f[3] = Math.min(1, rift.ttl / 45);
+    }
+    if (arena) {
+      f[4] = arena.phase === "fight" ? 1 : 0.5;
+      const b = G.EnemyMgr.get(arena.bossId);
+      f[5] = b && !b.dead ? b.hp / b.maxHp : 0;
+      f[6] = Math.max(0, 1 - arena.t / 120);
+    }
+    let best = null, bd = Infinity;
+    for (const e of G.EnemyMgr.all()) {
+      if (e.dead || !e.boss) continue;
+      const d = Math.hypot(e.x - h.x, e.y - h.y);
+      if (d < bd) { bd = d; best = e; }
+    }
+    if (best) {
+      f[7] = Math.max(-1, Math.min(1, (best.x - h.x) / FAR));
+      f[8] = Math.max(-1, Math.min(1, (best.y - h.y) / FAR));
+      f[9] = best.hp / best.maxHp;
+    }
+    return f;
+  }
+
+  function actionMask() {
+    const m = new Array(N_ACTIONS).fill(false);
+    const h = G.Game.player;
+    if (pending) {
+      for (let i = 0; i < Math.min(3, pending.options.length); i++) m[9 + i] = true;
+      return m;
+    }
+    for (let i = 0; i < 9; i++) m[i] = true;
+    if (h && !h.hasItem("choiceband"))
+      for (let i = 0; i < Math.min(4, h.slots.length); i++) if (i !== h.active) m[12 + i] = true;
+    return m;
   }
 
   function stats() {
@@ -260,7 +433,31 @@
       hp: h.hp, maxHp: h.maxHp, level: h.level, xp: h.xp, kills: h.kills,
       bosses: h.bosses, time: G.Game.st.time, dead: !!h.dead,
       progress: h.level - 1 + (h.xpNext ? Math.min(1, h.xp / h.xpNext) : 0),
-      moves: h.moves.map((m) => m.id + ":" + m.lvl),
+      moves: h.moves.map((m) => m.id + ":" + m.lvl + (m.evolved ? "*" : "")),
+      partner: (G.DEX_BY[h.dex] || {}).name || String(h.dex),
+      riftsEntered, riftsWon, riftsLost, inArena: G.Rift.inArena,
+    };
+  }
+
+  function result(before, hpLost, h0) {
+    const h = G.Game.player;
+    const after = stats() || before;
+    const obs = observe();
+    if (after.time !== before.time) lastPos = h ? [h.x, h.y] : null;
+    return {
+      obs,
+      mask: actionMask(),
+      stats: after,
+      hpLost: hpLost / (before ? before.maxHp : 100),
+      dKills: after.kills - before.kills,
+      dProgress: after.progress - before.progress,
+      dBoss: after.bosses - before.bosses,
+      dRiftIn: after.riftsEntered - before.riftsEntered,
+      dRiftWon: after.riftsWon - before.riftsWon,
+      dRiftLost: after.riftsLost - before.riftsLost,
+      dt: after.time - before.time,
+      done: !h || h !== h0 || (h.dead && !G.Rift.inArena) || G.Game.state === "over",
+      choice: !!pending,
     };
   }
 
@@ -268,10 +465,6 @@
     picks: [],
     ready() {
       return !!(window.G && G.DB && G.Game && G.Flow && G.RunUI && G.Ranking);
-    },
-    setManual(m) {
-      manual = m;
-      if (!m) { const q = queue; queue = []; for (const cb of q) realRAF(cb); }
     },
     pump,
     boot(partner, account) {
@@ -283,7 +476,7 @@
         else if (!s.partner) { G.DB.grant(partner, "starter"); s.partner = partner; }
       } else {
         if (G.DB.grant && !G.DB.owns(partner)) G.DB.grant(partner, "starter");
-        s.partner = partner;
+        s.partner = s.partner && G.DB.owns(s.partner) ? s.partner : partner;
       }
       s.starter = s.starter || s.partner;
       for (const id of ["tap-start", "boot"]) {
@@ -293,67 +486,90 @@
       hookUI();
       return s.partner;
     },
-    reset(partner, upgrade) {
+    // opts: {meta, learnCards, startTime, startLevels, partner}
+    reset(opts) {
       hookUI();
-      // finish the previous run properly so the game pays out its coins
+      learnCards = opts.learnCards !== false;
+      // only a real logged-in account may ever reach the leaderboard
+      ranking = !!opts.ranking && G.DB.loggedIn && !G.DB.guest && !(opts.startTime > 0);
+      pending = null;
+      // finish the previous run properly so the game pays out its coins / tickets
       if (G.Game.player && G.Game.state !== "ui" && G.Game.state !== "over") G.Game.quit();
-      if (partner) G.DB.save.partner = partner;
       G.UI.hideAll();
       if (G.Game.state !== "ui") G.Game.toUI();
-      const bought = upgrade ? autoUpgrade(G.DB.save.partner) : [];
+      const meta = { claimed: [], pulls: [], bought: [] };
+      if (opts.partner && G.DB.owns(opts.partner)) G.DB.save.partner = opts.partner;
+      if (opts.meta) {
+        meta.claimed = claimMissions();
+        meta.pulls = gacha();
+        if (opts.choosePartner !== false) choosePartner();
+        meta.bought = autoUpgrade(G.DB.save.partner);
+        if (G.DB.commit) G.DB.commit(true);
+      }
+      meta.partner = (G.DEX_BY[G.DB.save.partner] || {}).name;
+      meta.coins = G.DB.save.coins;
+      meta.tickets = G.DB.save.tickets;
+      meta.upgrades = (G.DB.save.pupg || {})[G.DB.save.partner] || {};
       G.Game.startRun();
       axis = [0, 0];
-      lastSlotSwitch = -99;
+      lastPos = null;
+      riftsEntered = riftsWon = riftsLost = 0;
+      wasInArena = false;
       RL.picks = [];
+      // curriculum: jump ahead in time with a matching number of level-ups
+      const h = G.Game.player;
+      if (opts.startTime > 0) G.Game.debugTime(opts.startTime);
+      for (let i = 0; i < (opts.startLevels || 0); i++) G.Game.debugLevelUp();
+      if (opts.startLevels) h.xpNext = G.Player.xpFor(h.level);
       pump(2);
-      prev = stats();
-      return { obs: observe(), stats: prev, bought, progress: RL.getProgress() };
-    },
-    getProgress() {
-      const s = G.DB.save;
-      return { coins: s.coins, pupg: s.pupg || {} };
-    },
-    setProgress(p) {
-      const s = G.DB.save;
-      if (!p) return false;
-      s.coins = p.coins || 0;
-      s.pupg = Object.assign(s.pupg || {}, p.pupg || {});
-      return true;
+      const before = stats();
+      return Object.assign(result(before, 0, h), { meta, partnerDex: G.DB.save.partner });
     },
     step(action, frames) {
-      const a = ACTIONS[action] || ACTIONS[0];
-      axis = [a[0], a[1]];
       const h0 = G.Game.player;
-      let hpLost = 0, xpGain = 0;
       const before = stats();
+      let hpLost = 0;
+      if (pending) {
+        // level-up card choice (time is frozen while the menu is open)
+        const p = pending;
+        pending = null;
+        const i = action >= 9 && action <= 11 && action - 9 < p.options.length ? action - 9 : heuristicPick(p.options, h0);
+        RL.picks.push(p.options[i].key);
+        p.cb(p.options[i]);
+        pump(1); // lets the game raise the next queued level-up, if any
+        return result(before, 0, h0);
+      }
+      if (action >= 12 && action <= 15) {
+        if (h0 && action - 12 < h0.slots.length) h0.setActive(action - 12);
+      } else if (action >= 0 && action <= 8) {
+        axis = MOVES[action].slice();
+      }
       for (let i = 0; i < frames; i++) {
         const hp = G.Game.player ? G.Game.player.hp : 0;
         pump(1);
         const h = G.Game.player;
         if (!h || h !== h0) break;
         if (h.hp < hp) hpLost += hp - h.hp;
-        if (G.Game.state === "over" || h.dead) break;
+        const inArena = G.Rift.inArena;
+        if (inArena && !wasInArena) riftsEntered++;
+        if (!inArena && wasInArena && riftsWon + riftsLost < riftsEntered) riftsLost++;
+        wasInArena = inArena;
+        if (G.Game.state === "over" || (h.dead && !inArena) || pending) break;
       }
-      const h = G.Game.player;
-      if (h && h === h0 && !h.dead) pickSlot(h);
-      const after = stats() || before;
-      const done = !h || h !== h0 || h.dead || G.Game.state === "over";
-      const r = {
-        obs: observe(),
-        stats: after,
-        hpLost: hpLost / (before ? before.maxHp : 100),
-        dKills: after.kills - before.kills,
-        dLevel: after.level - before.level,
-        dProgress: after.progress - before.progress,
-        dBoss: after.bosses - before.bosses,
-        dt: after.time - before.time,
-        done,
-        state: G.Game.state,
-      };
-      prev = after;
-      return r;
+      return result(before, hpLost, h0);
+    },
+    getSave() {
+      return JSON.stringify(G.DB.save);
+    },
+    setSave(json) {
+      const s = JSON.parse(json);
+      if (!s || !G.DB.save) return false;
+      Object.assign(G.DB.save, s);
+      return true;
     },
     observe,
+    actionMask,
     stats,
+    dims: { N_SECT, C, FEAT_DIM, SLOT_DIM, CARD_DIM, N_ACTIONS },
   };
 })();

@@ -1,14 +1,13 @@
 """Compare checkpoints under the same conditions and copy the best to models/best.zip.
 
-Each checkpoint plays N episodes with no permanent upgrades (fresh guest, coins not
-spent), so results only reflect the policy.
+Each checkpoint plays N normal runs as a fresh guest Charmander with no meta
+(no upgrades, gacha or partner switch), so results only reflect the policy.
 
     python evaluate.py --last 8 --episodes 10
 """
 import argparse
 import json
 import shutil
-from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -16,21 +15,19 @@ import numpy as np
 
 
 def run_checkpoint(path: str, episodes: int, partner: int) -> dict:
-    from stable_baselines3 import PPO
+    from sb3_contrib import MaskablePPO
     from pokesurvivor_rl.env import PokeSurvivorEnv
 
-    model = PPO.load(path, device="cpu")
-    env = PokeSurvivorEnv(headless=True, partner=partner, auto_upgrade=False)
+    model = MaskablePPO.load(path, device="cpu")
+    env = PokeSurvivorEnv(headless=True, partner=partner, meta=False)
     times, levels, kills = [], [], []
     try:
         for _ in range(episodes):
             obs, _ = env.reset()
-            frames = deque([np.zeros_like(obs)] * 3 + [obs], maxlen=4)
             done = False
             while not done:
-                a, _ = model.predict(np.concatenate(frames), deterministic=True)
+                a, _ = model.predict(obs, action_masks=env.action_masks(), deterministic=True)
                 obs, _, term, trunc, info = env.step(int(a))
-                frames.append(obs)
                 done = term or trunc
             st = info["stats"]
             times.append(st["time"]); levels.append(st["level"]); kills.append(st["kills"])
@@ -43,7 +40,7 @@ def run_checkpoint(path: str, episodes: int, partner: int) -> dict:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dir", default="checkpoints/ppo_pokesurvivor")
+    p.add_argument("--dir", default="checkpoints/maskppo_v2")
     p.add_argument("--last", type=int, default=8, help="evaluate the N most recent checkpoints")
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--partner", type=int, default=4)

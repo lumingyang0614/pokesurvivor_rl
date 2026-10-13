@@ -1,8 +1,12 @@
 """Gymnasium environment that plays https://pokesurvivor.com through Playwright.
 
-The agent controls movement (8 directions + stand still). Attacks are automatic in
-the game; level-up cards, move bonds and items are chosen by a simple heuristic in
-bridge.js so the policy can focus on dodging, kiting and collecting XP.
+Actions (masked, use MaskablePPO):
+  0 stand, 1-8 move in 8 directions, 9-11 pick a level-up card,
+  12-15 switch the active move slot (only the active slot attacks).
+Attacks are automatic in the game. Between runs a "meta" step claims missions,
+spends gacha tickets, picks the strongest owned partner and buys permanent upgrades.
+A curriculum sometimes starts runs later in the game (with matching level-ups that
+the agent chooses itself) so it also learns the late game.
 """
 from __future__ import annotations
 
@@ -21,8 +25,12 @@ from playwright.sync_api import sync_playwright
 GAME_URL = "https://pokesurvivor.com/en/"
 BRIDGE_JS = (Path(__file__).parent / "bridge.js").read_text(encoding="utf-8")
 
-N_SECT, N_CH, N_FEATS, N_NEAR = 16, 8, 14, 8 * 4
-OBS_DIM = N_SECT * N_CH + N_FEATS + N_NEAR
+# must match bridge.js
+N_SECT, N_CH, N_FEATS, N_NEAR, SLOT_DIM, CARD_DIM, N_ACTIONS = 16, 9, 36, 8 * 4, 21, 34, 16
+HIST_CH = 3        # enemy / density / projectile channels kept from previous steps
+N_HIST = 2
+GRID_DIM = N_SECT * N_CH
+OBS_DIM = GRID_DIM + N_HIST * N_SECT * HIST_CH + N_FEATS + N_NEAR + 4 * SLOT_DIM + 3 * CARD_DIM
 
 # Flags for the persistent (logged-in) profile: Google refuses sign-in from browsers
 # that announce they are automated.
@@ -40,12 +48,15 @@ class PokeSurvivorEnv(gym.Env):
         headless: bool = True,
         frame_skip: int = 3,
         partner: int = 4,
-        max_seconds: float = 20 * 60,
+        max_seconds: float = 30 * 60,
         realtime: bool = False,
         render: bool | None = None,
-        auto_upgrade: bool = True,
+        meta: bool = True,
+        choose_partner: bool = True,
+        curriculum: float = 0.0,
         save_path: str | None = None,
         profile_dir: str | None = None,
+        ranking: bool = False,
         record_dir: str | None = None,
         viewport=(960, 540),
     ):
@@ -57,8 +68,14 @@ class PokeSurvivorEnv(gym.Env):
         self.realtime = realtime
         self.record_dir = record_dir
         self.viewport = viewport
-        self.auto_upgrade = auto_upgrade
-        # JSON file that keeps coins + permanent upgrades across browser restarts
+        self.meta = meta
+        self.choose_partner = choose_partner
+        # probability that a run starts later in the game (late-game practice)
+        self.curriculum = curriculum
+        self.level_rate = 4.0          # levels granted per minute skipped, self-adjusting
+        self.max_start = 240.0         # latest start time, grows as the agent copes
+        self._cur_start = 0.0
+        # JSON file with the whole guest save (coins, tickets, Pokemon, upgrades)
         self.save_path = Path(save_path) if save_path else None
         # persistent browser profile with a logged-in game account (see login.py);
         # progress then lives in the account's cloud save instead of save_path
@@ -66,11 +83,14 @@ class PokeSurvivorEnv(gym.Env):
         if profile_dir:
             self.save_path = None
         self.account_user = None
-        self.last_bought: list = []
-        self.progress: dict = {}
+        # leaderboard submissions: only ever for a logged-in account, never for guests
+        self.ranking = bool(ranking and profile_dir)
+        self.last_meta: dict = {}
+        self.last_mask = np.ones(N_ACTIONS, bool)
+        self._hist = []
         # skip canvas drawing when nobody watches (headless training without video)
         self.render_frames = (not headless or bool(record_dir)) if render is None else render
-        self.action_space = spaces.Discrete(9)
+        self.action_space = spaces.Discrete(N_ACTIONS)
         self.observation_space = spaces.Box(-1.0, 1.0, (OBS_DIM,), np.float32)
         self._pw = self._browser = self._ctx = self.page = None
         self._ws = None
@@ -126,7 +146,11 @@ class PokeSurvivorEnv(gym.Env):
                 raise RuntimeError("Not logged in - run `python login.py` first")
         self.partner = self.page.evaluate(f"() => RL.boot({int(self.partner)}, {'true' if self.profile_dir else 'false'})")
         if self.save_path and self.save_path.exists():
-            self.page.evaluate("p => RL.setProgress(p)", json.loads(self.save_path.read_text()))
+            try:
+                self.page.evaluate("j => RL.setSave(j)", self.save_path.read_text(encoding="utf-8"))
+                self.partner = self.page.evaluate("() => G.DB.save.partner")
+            except Exception as e:
+                print("[env] could not restore save:", e)
         # Hot loop goes over a raw CDP websocket: ~0.2 ms per call instead of ~1.7 ms
         # through Playwright's driver.
         targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self._port}/json/list"))
@@ -150,10 +174,23 @@ class PokeSurvivorEnv(gym.Env):
         return json.loads(res["result"]["value"])
 
     # ------------------------------------------------------------------ gym api
-    @staticmethod
-    def _obs(o) -> np.ndarray:
-        v = np.concatenate([o["grid"], o["feats"], o["near"]]).astype(np.float32)
+    def _obs(self, o) -> np.ndarray:
+        grid = np.asarray(o["grid"], np.float32)
+        cur = grid.reshape(N_SECT, N_CH)[:, :HIST_CH].ravel()
+        if not self._hist:
+            self._hist = [np.zeros_like(cur)] * N_HIST
+        v = np.concatenate([grid, *self._hist, o["feats"], o["near"], o["slots"], o["cards"]]).astype(np.float32)
+        if o["feats"][14] < 0.5:  # not a menu step: time moved, shift the history
+            self._hist = [cur] + self._hist[:-1]
         return np.clip(v, -1.0, 1.0)
+
+    def action_masks(self) -> np.ndarray:
+        return self.last_mask
+
+    def _save_progress(self):
+        if self.save_path and self.page is not None:
+            self.save_path.parent.mkdir(parents=True, exist_ok=True)
+            self.save_path.write_text(self._eval("RL.getSave()"), encoding="utf-8")
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -164,15 +201,24 @@ class PokeSurvivorEnv(gym.Env):
         except Exception:
             self.close()
             self._launch()
-        r = self._eval(f"RL.reset({int(self.partner)}, {'true' if self.auto_upgrade else 'false'})")
+        start_time, start_levels = 0.0, 0
+        if self.curriculum and self.np_random.random() < self.curriculum:
+            start_time = float(self.np_random.uniform(60, self.max_start))
+            start_levels = int(round(self.level_rate * start_time / 60))
+        self._cur_start = start_time
+        opts = dict(meta=self.meta, choosePartner=self.choose_partner, learnCards=True, ranking=self.ranking,
+                    startTime=start_time, startLevels=start_levels)
+        if options:
+            opts.update(options)
+        r = self._eval(f"RL.reset({json.dumps(opts)})")
+        self.partner = r["partnerDex"]
         self.last_stats = r["stats"]
-        self.last_bought = r["bought"]
-        self.progress = r["progress"]
-        if self.save_path:
-            self.save_path.parent.mkdir(parents=True, exist_ok=True)
-            self.save_path.write_text(json.dumps(self.progress))
+        self.last_meta = r["meta"]
+        self.last_mask = np.asarray(r["mask"], bool)
+        self._save_progress()
+        self._hist = []
         self._t_last = time.perf_counter()
-        return self._obs(r["obs"]), {}
+        return self._obs(r["obs"]), {"meta": self.last_meta, "start_time": start_time}
 
     def step(self, action):
         try:
@@ -185,18 +231,31 @@ class PokeSurvivorEnv(gym.Env):
                     {"stats": st, "crashed": True})
         st = r["stats"]
         self.last_stats = st
+        self.last_mask = np.asarray(r["mask"], bool)
         reward = (
-            0.02 * self.frame_skip            # alive bonus (~0.6 / second)
+            0.6 * r["dt"]                     # alive bonus per in-game second
             - 6.0 * r["hpLost"]               # losing a full health bar costs 6
             + 0.03 * r["dKills"]
             + 1.0 * r["dProgress"]            # XP collected, 1.0 per full level
-            + 3.0 * r["dBoss"]
+            + 5.0 * r["dBoss"]                # map bosses (rifts only open when none is alive)
+            + 3.0 * r["dRiftIn"]              # stepped into a rift
+            + 20.0 * r["dRiftWon"]            # beat the legendary: bond + loot
+            - 3.0 * r["dRiftLost"]
         )
         terminated = bool(r["done"])
         if terminated:
             reward -= 5.0
         truncated = (not terminated) and st["time"] >= self.max_seconds
-        if self.realtime:
+        if (terminated or truncated) and self._cur_start > 0:
+            # late-game start: survived well -> start later and with fewer free levels;
+            # died quickly -> more free levels next time
+            lasted = st["time"] - self._cur_start
+            if lasted > 90:
+                self.max_start = min(1800.0, self.max_start * 1.05)
+                self.level_rate = max(1.0, self.level_rate * 0.97)
+            else:
+                self.level_rate = min(15.0, self.level_rate * 1.05)
+        if self.realtime and r["dt"] > 0:
             target = self.frame_skip / 30.0
             dt = time.perf_counter() - self._t_last
             if dt < target:
@@ -204,17 +263,21 @@ class PokeSurvivorEnv(gym.Env):
             self._t_last = time.perf_counter()
         info = {"stats": st}
         if terminated or truncated:
-            info["episode_stats"] = st
+            info["episode_stats"] = dict(st, start_time=self._cur_start, level_rate=self.level_rate,
+                                         max_start=self.max_start)
         return self._obs(r["obs"]), float(reward), terminated, truncated, info
 
     def upgrade_levels(self) -> dict:
-        return self.progress.get("pupg", {}).get(str(self.partner), {})
+        return self.last_meta.get("upgrades", {})
 
     def close(self):
-        if self.page is not None and self.save_path:
-            try:  # bank the coins of an unfinished run, then save
-                self._eval(f"(() => {{ if (G.Game.player && G.Game.state !== 'ui' && G.Game.state !== 'over') G.Game.quit(); return RL.getProgress(); }})()")
-                self.save_path.write_text(json.dumps(self._eval("RL.getProgress()")))
+        if self.page is not None and self._ws is not None:
+            try:  # bank the coins / tickets of an unfinished run, then save
+                self._eval("(() => { if (G.Game.player && G.Game.state !== 'ui' && G.Game.state !== 'over') G.Game.quit(); return 1; })()")
+                if self.profile_dir:
+                    self._eval("(() => { G.DB.commit && G.DB.commit(true); return 1; })()")
+                    time.sleep(2)  # let the cloud save flush
+                self._save_progress()
             except Exception:
                 pass
         try:

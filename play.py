@@ -1,13 +1,13 @@
 """Watch a trained agent play PokeSurvivor in a visible browser window.
 
     python play.py                                   # latest checkpoint (or models/best.zip)
-    python play.py --model models/best.zip           # the best evaluated model
-    python play.py --model checkpoints/ppo_pokesurvivor/final.zip
+    python play.py --model models/best.zip           # a specific model
+    python play.py --account                         # use the account logged in via login.py
+                                                     # (results also go to the leaderboard)
     python play.py --record videos                   # also save a .webm video
-    python play.py --random                          # baseline: random moves
+    python play.py --random                          # baseline: random (valid) actions
 """
 import argparse
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +16,7 @@ from pokesurvivor_rl.env import PokeSurvivorEnv
 
 
 def latest_checkpoint():
-    files = sorted(Path("checkpoints").glob("**/*.zip"), key=lambda f: f.stat().st_mtime)
+    files = sorted(Path("checkpoints").glob("maskppo*/*.zip"), key=lambda f: f.stat().st_mtime)
     if files:
         return files[-1]
     best = Path("models/best.zip")  # shipped with the repo
@@ -33,52 +33,59 @@ def main():
     p.add_argument("--random", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--save", type=str, default="progress/play.json",
-                   help="file that keeps coins + permanent upgrades between sessions")
+                   help="guest save file (coins, tickets, Pokemon, upgrades) kept between sessions")
     p.add_argument("--account", action="store_true",
                    help="play with the account logged in via login.py (progress saved to the account)")
-    p.add_argument("--no-upgrade", action="store_true", help="do not spend coins on upgrades")
+    p.add_argument("--no-ranking", action="store_true",
+                   help="with --account: do not submit results to the public leaderboard")
+    p.add_argument("--no-meta", action="store_true",
+                   help="do not claim missions / pull gacha / switch partner / buy upgrades")
+    p.add_argument("--keep-partner", action="store_true", help="never switch to a stronger partner")
     args = p.parse_args()
 
     model = None
     if not args.random:
-        from stable_baselines3 import PPO
+        from sb3_contrib import MaskablePPO
         path = args.model or latest_checkpoint()
         if path is None:
             raise SystemExit("No checkpoint found - train first, or pass --random")
         print("loading", path)
-        model = PPO.load(path, device="cpu")
+        model = MaskablePPO.load(path, device="cpu")
 
     env = PokeSurvivorEnv(headless=args.headless, partner=args.partner, record_dir=args.record,
-                          realtime=args.speed > 0, save_path=args.save,
-                          auto_upgrade=not args.no_upgrade,
-                          profile_dir="browser_profile" if args.account else None)
-    if args.speed > 0:
-        env.frame_skip = 3
-    n_stack = 4
+                          realtime=args.speed > 0, save_path=args.save, meta=not args.no_meta,
+                          choose_partner=not args.keep_partner,
+                          profile_dir="browser_profile" if args.account else None,
+                          ranking=args.account and not args.no_ranking)
+    rng = np.random.default_rng()
     try:
         for ep in range(args.episodes):
-            obs, _ = env.reset()
+            obs, info = env.reset()
+            meta = info["meta"]
             if ep == 0 and env.account_user:
-                print("account:", env.account_user, "| partner dex:", env.partner)
-            if env.last_bought:
-                print("   bought upgrades:", ", ".join(env.last_bought))
-            print(f"   coins: {env.progress.get('coins', 0)}  upgrades: {env.upgrade_levels() or '-'}")
-            # same as VecFrameStack: zeros, then the first observation last
-            frames = deque([np.zeros_like(obs)] * (n_stack - 1) + [obs], maxlen=n_stack)
+                print("account:", env.account_user, "| leaderboard:", "on" if env.ranking else "off")
+            if meta.get("claimed"):
+                print("   missions claimed:", ", ".join(meta["claimed"]))
+            if meta.get("pulls"):
+                print("   gacha:", ", ".join(meta["pulls"]))
+            if meta.get("bought"):
+                print("   bought upgrades:", ", ".join(meta["bought"]))
+            print(f"   partner: {meta.get('partner')}  coins: {meta.get('coins')}  "
+                  f"tickets: {meta.get('tickets')}  upgrades: {meta.get('upgrades') or '-'}")
             done, ret = False, 0.0
             while not done:
+                mask = env.action_masks()
                 if model is None:
-                    a = env.action_space.sample()
+                    a = rng.choice(np.flatnonzero(mask))
                 else:
-                    a, _ = model.predict(np.concatenate(frames), deterministic=True)
+                    a, _ = model.predict(obs, action_masks=mask, deterministic=True)
                 obs, r, term, trunc, info = env.step(int(a))
-                frames.append(obs)
                 ret += r
                 done = term or trunc
             st = info["stats"]
             m, s = divmod(int(st["time"]), 60)
             print(f"episode {ep + 1}: survived {m}:{s:02d}, level {st['level']}, kills {st['kills']}, "
-                  f"bosses {st['bosses']}, return {ret:.1f}")
+                  f"bosses {st['bosses']}, rifts won {st['riftsWon']}/{st['riftsEntered']}, return {ret:.1f}")
             print("   moves:", ", ".join(st["moves"]))
     finally:
         env.close()

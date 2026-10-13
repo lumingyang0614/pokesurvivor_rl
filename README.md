@@ -1,32 +1,58 @@
 # PokeSurvivor RL
 
-用強化學習 (PPO) 訓練 AI 玩 [PokéSurvivor](https://pokesurvivor.com/en/)。
+用強化學習 (MaskablePPO) 訓練 AI 玩 [PokéSurvivor](https://pokesurvivor.com/en/)，目標：**想盡辦法活得越久越好**。
 
 ## 運作方式
 
 ```
-Python (stable-baselines3 PPO)
-   │  action: 0=站著, 1-8=八方向移動
+Python (sb3-contrib MaskablePPO)
+   │  動作：移動 / 選升級卡 / 切換招式
    ▼
-Playwright ── Chromium ── pokesurvivor.com (原版遊戲)
-                  ▲
-          bridge.js（注入頁面）
+Playwright + CDP ── Chromium ── pokesurvivor.com（原版遊戲）
+                        ▲
+                bridge.js（注入頁面）
 ```
 
-- **不靠截圖辨識**：`pokesurvivor_rl/bridge.js` 在遊戲載入前注入，直接讀取遊戲的全域 `G` 物件
-  （玩家、敵人、敵方子彈、掉落物、地形、危險區）。
-- **時間由 Python 控制**：接管 `requestAnimationFrame`，每一步固定推進 3 個 1/30 秒的畫格，
-  所以訓練可以比真實時間快很多倍（單一瀏覽器約 20 倍速），而觀看時再放慢回真實速度。
-- **AI 負責移動**：遊戲本身會自動攻擊。升級卡片、招式連結 (Bond)、道具交換由簡單規則自動選擇。
-- 以「訪客」身份遊玩，並停用排行榜上傳，訓練不會灌爆官方排行榜。
+- **不靠截圖辨識**：`pokesurvivor_rl/bridge.js` 在遊戲載入前注入，直接讀取遊戲的全域 `G` 物件。
+- **時間由 Python 控制**：接管 `requestAnimationFrame`，每步固定推進 3 個 1/30 秒畫格；訓練時不繪圖，
+  12 個瀏覽器合計約 1000 步/秒（約遊戲時間 100 倍速）；觀看時放慢回真實速度。
+- 每一步透過原生 CDP websocket 呼叫（約 0.2 ms），比 Playwright API 快約 9 倍。
 
-### 觀測 (174 維 × 4 幀堆疊)
-- 16 個方向扇區 × 8 個通道：最近敵人、敵人密度、朝自己飛來的子彈、經驗/金幣、特殊道具、牆壁距離、危險區、Boss
-- 14 個玩家特徵：血量、等級、速度、經驗、時間、敵人數…
-- 最近 8 隻敵人的相對位置、傷害、剩餘血量
+### AI 自己決定的事（動作空間，16 個，依狀態遮罩）
+| 動作 | 說明 |
+|---|---|
+| 0–8 | 站著 / 八方向移動（攻擊由遊戲自動進行） |
+| 9–11 | 升級時選 3 張卡之一：新招式、招式升級、招式進化、能力提升 |
+| 12–15 | 切換出招的招式槽（遊戲中只有「目前招式槽」會攻擊） |
+
+### 觀測（494 維）
+- **16 個方向 × 9 通道**：最近敵人、敵人密度、朝自己飛來的子彈、經驗/金幣、特殊道具、
+  **牆壁與障礙物**、**水（減速）/岩漿（受傷）**、預警危險區、Boss；地形以 16 條射線探測 192 單位
+- 前 2 步的敵人/子彈通道（看得出移動方向）
+- 玩家狀態、夥伴基礎數值、各種倍率、是否被牆卡住
+- **裂縫**的方向/距離/剩餘時間、裂縫內傳說寶可夢血量與剩餘時間、最近**地圖 Boss** 的方向與血量
+- 最近 8 隻敵人、4 個招式槽、升級時 3 張卡片的內容
 
 ### 獎勵
-存活每秒 +0.6、損血（整條血 -6）、擊殺 +0.03、收集經驗（每升一級共 +1）、擊敗 Boss +3、死亡 -5
+存活每秒 +0.6、損血（整條血 -6）、擊殺 +0.03、收集經驗（每升一級共 +1）、
+擊敗地圖 Boss +5、進入裂縫 +3、**打贏裂縫 +20**、裂縫落敗 -3、死亡 -5
+
+### 裂縫 (Rift) 與 Boss
+遊戲 75 秒後、場上**沒有 Boss** 時，每 30 秒有機會在遠處出現裂縫（存在 45 秒）。走進去會和傳說寶可夢單挑，
+贏了得到「羈絆」（多招式同時發動）並吸走全地圖的掉落物。在裂縫裡倒下不算遊戲結束（會被彈出並復活）。
+所以 AI 需要學會：先清掉地圖 Boss → 找到裂縫 → 打贏傳說寶可夢。
+
+### 遊戲後期訓練（課程學習）
+40% 的訓練局會直接從較晚的時間開始（1 分鐘起，最晚可到 30 分鐘），並給予對應次數的升級（由 AI 自己選卡）。
+撐得好就讓起始時間變晚、送的等級變少；撐不住就多送等級——難度自動調整，讓 AI 練到後期的怪潮。
+
+### 局與局之間（自動）
+1. 領取完成的任務獎勵（含扭蛋券）
+2. **扭蛋抽角色**（用掉所有扭蛋券）
+3. 換成手上最強的寶可夢（考慮基礎數值與已買的永久強化）
+4. 用金幣買永久強化（攻擊、體力、冷卻、防禦、磁鐵、回復、爆擊…）
+
+訪客存檔（金幣、券、寶可夢、強化）存在 `progress/*.json`，每個訓練環境各自累積。
 
 ## 使用
 
@@ -35,31 +61,24 @@ pip install -r requirements.txt
 python -m playwright install chromium
 
 # 訓練（12 個平行瀏覽器，背景無頭模式）
-python train.py --envs 12 --steps 4000000
-tensorboard --logdir runs          # 看 game/survive_sec 曲線
+python train.py --envs 12 --steps 20000000
+tensorboard --logdir runs          # game/survive_sec、game/rifts_won、late/* 曲線
+
+# 挑出最佳模型 → models/best.zip
+python evaluate.py --last 8 --episodes 10
 
 # 讓 AI 玩給你看（開瀏覽器視窗，真實速度）
 python play.py
 python play.py --record videos     # 同時錄成 .webm
-python play.py --random            # 對照組：亂走
-python play.py --speed 0           # 不限速快速跑
+python play.py --random            # 對照組：隨機
 ```
-
-### 永久強化（遊戲裡的「Mejoras／強化」選單）
-每局結束時遊戲會依存活時間、擊殺數發金幣。下一局開始前，AI 會自動把金幣花在該寶可夢的永久強化上
-（攻擊、體力、冷卻、防禦、磁鐵、回復、爆擊、速度、經驗、金幣加成），優先買「便宜又想要」的項目。
-金幣與強化等級存在 `progress/*.json`，關掉瀏覽器也不會消失：
-- `progress/play.json`：觀看模式用（`--save` 可換檔、`--no-upgrade` 關閉自動強化）
-- `progress/train_env*.json`：每個訓練環境各自累積
 
 ### 用自己的帳號記錄（選用）
 ```bash
 python login.py            # 開視窗，自己登入（Google 或遊戲帳號），登入後自動關閉
-python play.py --account   # 用該帳號玩，金幣／強化／統計存到雲端帳號
+python play.py --account   # 用該帳號玩：存檔、扭蛋、強化、統計存到雲端，成績上排行榜
+python play.py --account --no-ranking   # 不上排行榜
 ```
 - 登入資訊只存在本機 `browser_profile/`（已列入 .gitignore），密碼只在瀏覽器視窗輸入。
-- 只有觀看模式會用帳號；訓練一律用訪客，避免多個瀏覽器同時寫同一份雲端存檔。
-- AI 的成績**不會**上傳公開排行榜。
-
-`--partner` 可換夥伴（圖鑑編號，例如 1 妙蛙種子、4 小火龍、7 傑尼龜）。
-Checkpoints 存在 `checkpoints/<name>/`，`--resume` 可接續訓練。
+- **只有登入帳號的觀看模式**會上傳排行榜；訓練一律用訪客且不上傳，避免灌爆官方伺服器。
+- `--keep-partner` 不自動換角色，`--no-meta` 不領任務/不抽卡/不買強化。

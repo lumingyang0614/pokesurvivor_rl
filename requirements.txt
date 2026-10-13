@@ -5,3 +5,4 @@ torch>=2.2
 numpy
 tensorboard
 websocket-client
+sb3-contrib>=2.3
