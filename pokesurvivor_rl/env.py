@@ -236,6 +236,11 @@ class PokeSurvivorEnv(gym.Env):
         return 2.0 * (prev[0] - cur[0]) + 2.0 * (cur[1] - prev[1])
 
     @staticmethod
+    def _chest_weight(t: float) -> float:
+        """3x at the start of a run, easing to 1x by minute 3."""
+        return 1.0 + 2.0 * max(0.0, 1.0 - t / 180.0)
+
+    @staticmethod
     def _openness(grid) -> float:
         """0..1: how far the walls are, averaged over 16 directions (1 = open field)."""
         return 1.0 - float(np.mean(np.asarray(grid, np.float32).reshape(N_SECT, N_CH)[:, 5]))
@@ -302,8 +307,8 @@ class PokeSurvivorEnv(gym.Env):
             + 40.0 * r["dRiftWon"]            # beat the legendary: bond + loot (top priority)
             - 3.0 * r["dRiftLost"]
             + self._rift_shaping(r["obs"]["feats"])
-            + 6.0 * r["dBigChest"]            # big chest: coins + gacha tickets
-            + self._chest_shaping(r["obs"]["map"])
+            # big chest: coins + gacha tickets; worth most early, while the map is quiet
+            + self._chest_weight(st["time"]) * (6.0 * r["dBigChest"] + self._chest_shaping(r["obs"]["map"]))
             + 0.25 * r["dt"] * self._openness(r["obs"]["grid"])  # fight in the open, not in corners
             + 0.5 * r["dChest"]
         )
