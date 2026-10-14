@@ -215,25 +215,28 @@ class PokeSurvivorEnv(gym.Env):
             self._hist = [cur] + self._hist[:-1]
         return np.clip(v, -1.0, 1.0)
 
-    def _rift_shaping(self, feats) -> float:
-        """Reward for closing in on an open rift (it lives 45 s, 380-560 units away).
+    def _rift_shaping(self, feats, entered) -> float:
+        """Every rift should be fought: reward closing in on an open rift (it lives 45 s,
+        380-560 units away) and punish letting one expire without stepping in.
         feats[26:29] = rift exists, dx, dy (in units of 900, see riftFeats in bridge.js)."""
         d = float(np.hypot(feats[27], feats[28])) if feats[26] > 0 else None
         prev, self._rift_d = self._rift_d, d
+        if prev is not None and d is None and not entered:
+            return -10.0  # rift closed and we never went in
         if d is None or prev is None:
             return 0.0
-        return 3.0 * (prev - d)  # ~1.5 total for walking from 450 units away to the rift
+        return 6.0 * (prev - d)  # ~3 total for walking from 450 units away to the rift
 
     def _chest_shaping(self, m) -> float:
         """Reward for walking to the nearest big chest and staying next to it while it opens
         (3.5 s; the progress drains when you step away). m = map block from bridge.js:
-        [80] big chest exists, [81:83] dx, dy in units of 900, [89] open progress 0..1."""
+        [80] big chest exists, [81:83] dx, dy in units of 2400, [89] open progress 0..1."""
         base = N_SECT * 5
         cur = (float(np.hypot(m[base + 1], m[base + 2])), float(m[base + 9])) if m[base] > 0 else None
         prev, self._chest = self._chest, cur
         if cur is None or prev is None:
             return 0.0
-        return 2.0 * (prev[0] - cur[0]) + 2.0 * (cur[1] - prev[1])
+        return 5.0 * (prev[0] - cur[0]) + 2.0 * (cur[1] - prev[1])  # ~5 for walking 2400 units
 
     @staticmethod
     def _chest_weight(t: float) -> float:
@@ -303,10 +306,10 @@ class PokeSurvivorEnv(gym.Env):
             + 0.03 * r["dKills"]
             + 1.0 * r["dProgress"]            # XP collected, 1.0 per full level
             + 5.0 * r["dBoss"]                # map bosses (rifts only open when none is alive)
-            + 8.0 * r["dRiftIn"]              # stepped into a rift
+            + 15.0 * r["dRiftIn"]             # stepped into a rift (every rift must be fought)
             + 40.0 * r["dRiftWon"]            # beat the legendary: bond + loot (top priority)
             - 3.0 * r["dRiftLost"]
-            + self._rift_shaping(r["obs"]["feats"])
+            + self._rift_shaping(r["obs"]["feats"], r["dRiftIn"] > 0)
             # big chest: coins + gacha tickets; worth most early, while the map is quiet
             + self._chest_weight(st["time"]) * (6.0 * r["dBigChest"] + self._chest_shaping(r["obs"]["map"]))
             + 0.25 * r["dt"] * self._openness(r["obs"]["grid"])  # fight in the open, not in corners

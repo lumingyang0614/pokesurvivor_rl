@@ -92,6 +92,7 @@
   // and spring/altar further away
   const MAP_CH = 5;
   const MAP_DIM = N_SECT * MAP_CH + 10;
+  const CHEST_FAR = 2400;    // big chests are searched this far (every 15 steps: ~1 ms)
   const FAR = 900;            // range for rift / boss direction features
 
   let axis = [0, 0];
@@ -104,6 +105,7 @@
   let lastPos = null;
   let riftsEntered = 0, riftsWon = 0, riftsLost = 0, wasInArena = false;
   let chests = 0, bigChests = 0;
+  let farChest = null, farAge = 0, farOpened = -1;   // cached far big-chest search
 
   function sectorOf(dx, dy) {
     let a = Math.atan2(dy, dx);
@@ -372,12 +374,24 @@
       else if (o.type === "trap") add(o, 4, -1);
       else if ((o.type === "altar" && !o.used) || (o.type === "spring" && o.charge > 0.15)) add(o, 3, 2);
     }
+    if (--farAge <= 0 || farOpened !== bigChests) {
+      farAge = 15;
+      farOpened = bigChests;
+      farChest = null;
+      let best = Infinity;
+      for (const o of G.World.specialsNear(h.x, h.y, CHEST_FAR)) {
+        const d = o.type === "bigchest" ? Math.hypot(o.x - h.x, o.y - h.y) : Infinity;
+        if (d < best) { best = d; farChest = o; }
+      }
+    }
+    if (!near[0] && farChest) near[0] = farChest;
     let at = N_SECT * MAP_CH;
     near.forEach((o, i) => {
       if (o) {
+        const scale = i === 0 ? CHEST_FAR : FAR;
         f[at] = 1;
-        f[at + 1] = Math.max(-1, Math.min(1, (o.x - h.x) / FAR));
-        f[at + 2] = Math.max(-1, Math.min(1, (o.y - h.y) / FAR));
+        f[at + 1] = Math.max(-1, Math.min(1, (o.x - h.x) / scale));
+        f[at + 2] = Math.max(-1, Math.min(1, (o.y - h.y) / scale));
       }
       at += 3;
     });
@@ -683,6 +697,7 @@
       lastPos = null;
       riftsEntered = riftsWon = riftsLost = 0;
       chests = bigChests = 0;
+      farChest = null; farAge = 0;
       wasInArena = false;
       RL.picks = [];
       // curriculum: jump ahead in time with a matching number of level-ups
