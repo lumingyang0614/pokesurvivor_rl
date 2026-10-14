@@ -255,6 +255,15 @@ class PokeSurvivorEnv(gym.Env):
         return 1.0 + 2.0 * max(0.0, 1.0 - t / 180.0)
 
     @staticmethod
+    def _danger(grid) -> float:
+        """0..2: standing inside a telegraphed attack zone (1) plus how close the nearest
+        incoming projectile is (0..1, only once it is within ~70 units)."""
+        g = np.asarray(grid, np.float32).reshape(N_SECT, N_CH)
+        in_zone = 1.0 if g[:, 7].max() >= 0.99 else 0.0
+        proj = float(g[:, 2].max())
+        return in_zone + max(0.0, (proj - 0.8) / 0.2)
+
+    @staticmethod
     def _openness(grid) -> float:
         """0..1: how far the walls are, averaged over 16 directions (1 = open field)."""
         return 1.0 - float(np.mean(np.asarray(grid, np.float32).reshape(N_SECT, N_CH)[:, 5]))
@@ -314,8 +323,10 @@ class PokeSurvivorEnv(gym.Env):
         self.last_mask = np.asarray(r["mask"], bool)
         reward = (
             0.6 * r["dt"]                     # alive bonus per in-game second
-            # losing a full health bar costs 6, double inside a rift: dodge the legendary's moves
-            - (12.0 if st.get("inArena") else 6.0) * r["hpLost"]
+            # losing a full health bar costs 8, double inside a rift: dodge the legendary's moves
+            - (16.0 if st.get("inArena") else 8.0) * r["hpLost"]
+            # get out of telegraphed attacks and away from incoming shots before they land
+            - (2.0 if st.get("inArena") else 1.0) * 1.5 * r["dt"] * self._danger(r["obs"]["grid"])
             + 0.03 * r["dKills"]
             + 1.0 * r["dProgress"]            # XP collected, 1.0 per full level
             + 5.0 * r["dBoss"]                # map bosses (rifts only open when none is alive)
