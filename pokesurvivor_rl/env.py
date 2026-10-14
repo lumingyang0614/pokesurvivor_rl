@@ -32,10 +32,11 @@ BRIDGE_JS = (Path(__file__).parent / "bridge.js").read_text(encoding="utf-8")
 N_SECT, N_CH, N_FEATS, N_NEAR, SLOT_DIM, CARD_DIM, N_ACTIONS = 16, 9, 36, 8 * 4, 21, 34, 16
 CHOICE_DIM = 3 + 11 + 3 * (19 + 11)   # open menu kind, held item, bond / item options
 MAP_DIM = N_SECT * 5 + 10             # chests, grass, springs/altars, traps
+AIM_DIM = 4 * 2 + 2 + 4 + 3           # own attacks: slot range/cooldown, aim, target
 HIST_CH = 3        # enemy / density / projectile channels kept from previous steps
 N_HIST = 2
 GRID_DIM = N_SECT * N_CH
-OBS_DIM = GRID_DIM + N_HIST * N_SECT * HIST_CH + N_FEATS + N_NEAR + 4 * SLOT_DIM + 3 * CARD_DIM + CHOICE_DIM + MAP_DIM
+OBS_DIM = GRID_DIM + N_HIST * N_SECT * HIST_CH + N_FEATS + N_NEAR + 4 * SLOT_DIM + 3 * CARD_DIM + CHOICE_DIM + MAP_DIM + AIM_DIM
 
 # Flags for the persistent (logged-in) profile: Google refuses sign-in from browsers
 # that announce they are automated.
@@ -211,7 +212,7 @@ class PokeSurvivorEnv(gym.Env):
         cur = grid.reshape(N_SECT, N_CH)[:, :HIST_CH].ravel()
         if not self._hist:
             self._hist = [np.zeros_like(cur)] * N_HIST
-        v = np.concatenate([grid, *self._hist, o["feats"], o["near"], o["slots"], o["cards"], o["choice"], o["map"]]).astype(np.float32)
+        v = np.concatenate([grid, *self._hist, o["feats"], o["near"], o["slots"], o["cards"], o["choice"], o["map"], o["aim"]]).astype(np.float32)
         if o["feats"][14] < 0.5:  # not a menu step: time moved, shift the history
             self._hist = [cur] + self._hist[:-1]
         return np.clip(v, -1.0, 1.0)

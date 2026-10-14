@@ -92,6 +92,9 @@
   // and spring/altar further away
   const MAP_CH = 5;
   const MAP_DIM = N_SECT * MAP_CH + 10;
+  // own attacks: range + cooldown of each slot, aim direction, what is being targeted
+  const TARGETS = ["enemy", "boss", "projectile", "prop"];
+  const AIM_DIM = 4 * 2 + 2 + TARGETS.length + 1 + 2;
   const CHEST_FAR = 2400;    // big chests are searched this far (every 15 steps: ~1 ms)
   const FAR = 900;            // range for rift / boss direction features
 
@@ -399,6 +402,55 @@
     return f;
   }
 
+  // reach of a move, as the game's own Combat module measures it (moves of the gated
+  // kinds only fire once the target is this close)
+  function moveRange(m) {
+    switch (m.kind) {
+      case "melee": return m.radius + 30;
+      case "beam": return m.radius + 20;
+      case "boomerang": return m.radius + 40;
+      case "chain": return 280;
+      case "meteor": return 340;
+      case "dash": return m.radius + 60;
+      case "cone": return m.speed * m.life + 30;
+      case "projectile": return 520;
+      case "nova": return (m.speed || 0) * (m.life || 0);
+      case "turret": return m.range || 0;
+      case "buff": return 0;
+      default: return m.radius || 0;   // orbit, aura, trail, mine
+    }
+  }
+  // 1 = ready to fire, 0 = just fired
+  function moveReady(m, h) {
+    if (m.kind === "orbit") return 1;
+    const cd = Math.max(0.05, (m.cd || 1) * (h.cdMul || 1));
+    return 1 - Math.max(0, Math.min(1, (m.t || 0) / cd));
+  }
+
+  function aimFeat(h) {
+    const f = new Array(AIM_DIM).fill(0);
+    if (!h) return f;
+    h.slots.slice(0, 4).forEach((g, i) => {
+      f[i * 2] = Math.min(1, Math.max(0, ...g.map(moveRange)) / 520);
+      f[i * 2 + 1] = Math.max(0, ...g.map((m) => moveReady(m, h)));
+    });
+    let at = 8;
+    f[at++] = Math.cos(h.aim || 0);
+    f[at++] = Math.sin(h.aim || 0);
+    const t = h.target;
+    if (t) {
+      const kind = t.tx !== undefined ? "prop" : t.boss ? "boss" : t.maxHp ? "enemy" : "projectile";
+      f[at + TARGETS.indexOf(kind)] = 1;
+    }
+    at += TARGETS.length;
+    const d = t ? Math.hypot(t.x - h.x, t.y - h.y) : 0;
+    f[at++] = t ? Math.min(1, d / 520) : 0;
+    const reach = Math.max(0, ...h.activeGroup().map(moveRange));
+    f[at++] = t && d <= reach ? 1 : 0;                  // target within reach of the active slot
+    f[at++] = Math.min(1, reach / 520);
+    return f;
+  }
+
   function choiceFeat(h) {
     const f = new Array(CHOICE_DIM).fill(0);
     if (!h) return f;
@@ -437,7 +489,7 @@
     const slots = new Array(4 * SLOT_DIM).fill(0);
     const cards = new Array(3 * CARD_DIM).fill(0);
     if (!h) return { grid: Array.from(grid), feats: new Array(FEAT_DIM).fill(0), near: Array.from(near), slots, cards,
-                     choice: choiceFeat(h), map: mapFeat(h) };
+                     choice: choiceFeat(h), map: mapFeat(h), aim: aimFeat(h) };
     const px = h.x, py = h.y;
     const enemies = [];
     let bossAlive = 0;
@@ -542,7 +594,7 @@
       Math.min(1, (G.Game.st.time % 240) / 240),
       ...riftFeats(h),
     ];
-    return { grid: Array.from(grid), feats, near: Array.from(near), slots, cards, choice: choiceFeat(h), map: mapFeat(h) };
+    return { grid: Array.from(grid), feats, near: Array.from(near), slots, cards, choice: choiceFeat(h), map: mapFeat(h), aim: aimFeat(h) };
   }
 
   // rift (portal to a legendary fight) and the nearest map boss, often beyond SENSE
@@ -756,6 +808,6 @@
     observe,
     actionMask,
     stats,
-    dims: { N_SECT, C, FEAT_DIM, SLOT_DIM, CARD_DIM, CHOICE_DIM, MAP_DIM, N_ACTIONS },
+    dims: { N_SECT, C, FEAT_DIM, SLOT_DIM, CARD_DIM, CHOICE_DIM, MAP_DIM, AIM_DIM, N_ACTIONS },
   };
 })();
