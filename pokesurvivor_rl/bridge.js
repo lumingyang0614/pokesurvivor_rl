@@ -55,7 +55,7 @@
   // ------------------------------------------------------------------ constants
   const N_SECT = 16;
   const SENSE = 360;          // world units the agent "sees"
-  const TERRAIN_RANGE = 192;  // how far walls / liquid are probed
+  const TERRAIN_RANGE = 400;  // how far walls / liquid are probed (about the whole screen)
   const C = 9;                // grid channels per sector
   // 0 enemy proximity, 1 enemy density, 2 hostile projectiles, 3 xp/coins,
   // 4 special pickups, 5 walls & solid props, 6 liquid (water slows, lava hurts),
@@ -461,7 +461,7 @@
     for (let i = 0; i < N_SECT; i++) {
       const [cx, cy] = DIRS[i];
       let wall = 0, water = 0;
-      for (let r = 16; r <= TERRAIN_RANGE; r += 16) {
+      for (let r = 16; r <= TERRAIN_RANGE; r += 24) {
         const x = px + cx * r, y = py + cy * r, near = 1 - (r - 16) / TERRAIN_RANGE;
         if (!water && G.World.isLiquid(x, y)) water = near * liqVal;
         if (!G.World.isFree(x, y, h.r, true)) { wall = near; break; }
@@ -469,8 +469,8 @@
       grid[i * C + 5] = wall;
       grid[i * C + 6] = water;
       if (haz.length) {
-        for (const r of [0, 40, 80, 130]) {
-          if (hazardAt(haz, px + cx * r, py + cy * r, h.r)) { grid[i * C + 7] = Math.max(grid[i * C + 7], 1 - r / 160); break; }
+        for (const r of [0, 45, 90, 140, 190, 240]) {
+          if (hazardAt(haz, px + cx * r, py + cy * r, h.r)) { grid[i * C + 7] = Math.max(grid[i * C + 7], 1 - r / 280); break; }
         }
       }
     }

@@ -102,6 +102,7 @@ class PokeSurvivorEnv(gym.Env):
         self.mirror = (not profile_dir) if mirror is None else mirror
         self.last_meta: dict = {}
         self._rift_d = None
+        self._chest = None
         self.last_mask = np.ones(N_ACTIONS, bool)
         self._hist = []
         # skip canvas drawing when nobody watches (headless training without video)
@@ -223,6 +224,22 @@ class PokeSurvivorEnv(gym.Env):
             return 0.0
         return 3.0 * (prev - d)  # ~1.5 total for walking from 450 units away to the rift
 
+    def _chest_shaping(self, m) -> float:
+        """Reward for walking to the nearest big chest and staying next to it while it opens
+        (3.5 s; the progress drains when you step away). m = map block from bridge.js:
+        [80] big chest exists, [81:83] dx, dy in units of 900, [89] open progress 0..1."""
+        base = N_SECT * 5
+        cur = (float(np.hypot(m[base + 1], m[base + 2])), float(m[base + 9])) if m[base] > 0 else None
+        prev, self._chest = self._chest, cur
+        if cur is None or prev is None:
+            return 0.0
+        return 2.0 * (prev[0] - cur[0]) + 2.0 * (cur[1] - prev[1])
+
+    @staticmethod
+    def _openness(grid) -> float:
+        """0..1: how far the walls are, averaged over 16 directions (1 = open field)."""
+        return 1.0 - float(np.mean(np.asarray(grid, np.float32).reshape(N_SECT, N_CH)[:, 5]))
+
     def action_masks(self) -> np.ndarray:
         return self.last_mask
 
@@ -259,6 +276,7 @@ class PokeSurvivorEnv(gym.Env):
         self._save_progress()
         self._hist = []
         self._rift_d = None
+        self._chest = None
         self._t_last = time.perf_counter()
         return self._obs(r["obs"]), {"meta": self.last_meta, "start_time": start_time}
 
@@ -285,6 +303,8 @@ class PokeSurvivorEnv(gym.Env):
             - 3.0 * r["dRiftLost"]
             + self._rift_shaping(r["obs"]["feats"])
             + 6.0 * r["dBigChest"]            # big chest: coins + gacha tickets
+            + self._chest_shaping(r["obs"]["map"])
+            + 0.25 * r["dt"] * self._openness(r["obs"]["grid"])  # fight in the open, not in corners
             + 0.5 * r["dChest"]
         )
         terminated = bool(r["done"])
