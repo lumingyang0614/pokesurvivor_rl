@@ -103,6 +103,7 @@ class PokeSurvivorEnv(gym.Env):
         self.last_meta: dict = {}
         self._rift_d = None
         self._chest = None
+        self._legend_hp = None
         self.last_mask = np.ones(N_ACTIONS, bool)
         self._hist = []
         # skip canvas drawing when nobody watches (headless training without video)
@@ -238,6 +239,15 @@ class PokeSurvivorEnv(gym.Env):
             return 0.0
         return 5.0 * (prev[0] - cur[0]) + 2.0 * (cur[1] - prev[1])  # ~5 for walking 2400 units
 
+    def _legend_damage(self, feats) -> float:
+        """Share of the rift legendary's health removed this step (feats[30] = fight phase,
+        feats[31] = its health 0..1, see riftFeats in bridge.js)."""
+        cur = float(feats[31]) if feats[30] >= 1.0 else None
+        prev, self._legend_hp = self._legend_hp, cur
+        if cur is None or prev is None:
+            return 0.0
+        return max(0.0, prev - cur)
+
     @staticmethod
     def _chest_weight(t: float) -> float:
         """3x at the start of a run, easing to 1x by minute 3."""
@@ -285,6 +295,7 @@ class PokeSurvivorEnv(gym.Env):
         self._hist = []
         self._rift_d = None
         self._chest = None
+        self._legend_hp = None
         self._t_last = time.perf_counter()
         return self._obs(r["obs"]), {"meta": self.last_meta, "start_time": start_time}
 
@@ -302,13 +313,15 @@ class PokeSurvivorEnv(gym.Env):
         self.last_mask = np.asarray(r["mask"], bool)
         reward = (
             0.6 * r["dt"]                     # alive bonus per in-game second
-            - 6.0 * r["hpLost"]               # losing a full health bar costs 6
+            # losing a full health bar costs 6, double inside a rift: dodge the legendary's moves
+            - (12.0 if st.get("inArena") else 6.0) * r["hpLost"]
             + 0.03 * r["dKills"]
             + 1.0 * r["dProgress"]            # XP collected, 1.0 per full level
             + 5.0 * r["dBoss"]                # map bosses (rifts only open when none is alive)
             + 15.0 * r["dRiftIn"]             # stepped into a rift (every rift must be fought)
             + 40.0 * r["dRiftWon"]            # beat the legendary: bond + loot (top priority)
-            - 3.0 * r["dRiftLost"]
+            - 15.0 * r["dRiftLost"]           # thrown out of the rift (fainted / time up)
+            + 10.0 * self._legend_damage(r["obs"]["feats"])  # wear the legendary down
             + self._rift_shaping(r["obs"]["feats"], r["dRiftIn"] > 0)
             # big chest: coins + gacha tickets; worth most early, while the map is quiet
             + self._chest_weight(st["time"]) * (6.0 * r["dBigChest"] + self._chest_shaping(r["obs"]["map"]))
